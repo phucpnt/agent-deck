@@ -328,6 +328,71 @@ def parse_profile_prefix(text: str, profiles: list[str]) -> tuple[str | None, st
 # ---------------------------------------------------------------------------
 
 
+_MDV2_CHARS = frozenset('_*[]()~`>#+-=|{}.!')
+
+
+def _escape_mdv2(text: str) -> str:
+    """Escape MarkdownV2 special characters."""
+    return "".join("\\" + c if c in _MDV2_CHARS else c for c in text)
+
+
+def _escape_mdv2_code(text: str) -> str:
+    """Escape inside MarkdownV2 code blocks (only ` and \\ need escaping)."""
+    return text.replace("\\", "\\\\").replace("`", "\\`")
+
+
+def md_to_telegram_mdv2(text: str) -> str:
+    """Convert standard Markdown to Telegram MarkdownV2."""
+    # 1. Extract fenced code blocks (protect from general escaping)
+    code_blocks = []
+
+    def _save_code_block(m):
+        lang = m.group(1)
+        code = _escape_mdv2_code(m.group(2))
+        idx = len(code_blocks)
+        block = f"```{lang}\n{code}\n```" if lang else f"```\n{code}\n```"
+        code_blocks.append(block)
+        return f"\x00CB{idx}\x00"
+
+    text = re.sub(r"```(\w*)\n(.*?)\n```", _save_code_block, text, flags=re.DOTALL)
+
+    # 2. Extract inline code
+    inline_codes = []
+
+    def _save_inline(m):
+        code = _escape_mdv2_code(m.group(1))
+        idx = len(inline_codes)
+        inline_codes.append(f"`{code}`")
+        return f"\x00IC{idx}\x00"
+
+    text = re.sub(r"`([^`\n]+)`", _save_inline, text)
+
+    # 3. Escape all MarkdownV2 special chars
+    text = _escape_mdv2(text)
+
+    # 4. Convert escaped Markdown patterns to MarkdownV2 formatting
+    # Bold: \*\*text\*\* -> *text*
+    text = re.sub(r"\\\*\\\*(.+?)\\\*\\\*", r"*\1*", text)
+    # Italic: \*text\* -> _text_
+    text = re.sub(r"\\\*([^\n]+?)\\\*", r"_\1_", text)
+    # Headers: \#+ text -> *text* (bold)
+    text = re.sub(r"^(?:\\\#)+\s+(.+)$", r"*\1*", text, flags=re.MULTILINE)
+    # Horizontal rule: \-\-\- -> (remove)
+    text = re.sub(r"^(?:\\\-){3,}$", "", text, flags=re.MULTILINE)
+    # Bullets: \- text -> bullet
+    text = re.sub(r"^\\\- ", "\u2022 ", text, flags=re.MULTILINE)
+
+    # 5. Restore protected blocks
+    for i, block in enumerate(code_blocks):
+        text = text.replace(f"\x00CB{i}\x00", block)
+    for i, code in enumerate(inline_codes):
+        text = text.replace(f"\x00IC{i}\x00", code)
+
+    # Clean up extra blank lines
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
 def split_message(text: str, max_len: int = TG_MAX_LENGTH) -> list[str]:
     """Split a long message into chunks that fit Telegram's limit."""
     if len(text) <= max_len:
@@ -552,34 +617,75 @@ def create_bot(config: dict) -> tuple[Bot, Dispatcher]:
             )
             return
 
-        # Send to conductor
+        # Send to conductor with progress updates
         log.info(
             "User message -> [%s]: %s", target_profile, cleaned_msg[:100]
         )
-        ok, response = send_to_conductor(
-            session_title,
-            cleaned_msg,
-            profile=target_profile,
-            wait_for_reply=True,
-            response_timeout=RESPONSE_TIMEOUT,
-        )
-        if not ok:
-            await message.answer(
-                f"[Failed to send message to conductor [{target_profile}].]"
-            )
-            return
-
-        # Response is returned directly by `session send --wait`.
         profile_tag = (
             f"[{target_profile}] " if len(profiles) > 1 else ""
         )
-        await message.answer(f"{profile_tag}...")  # typing indicator
+        status_msg = await message.answer(f"{profile_tag}Working on it...")
+
+        # Run blocking CLI call in a thread so we can update progress
+        loop = asyncio.get_event_loop()
+        conductor_future = loop.run_in_executor(
+            None,
+            lambda: send_to_conductor(
+                session_title,
+                cleaned_msg,
+                profile=target_profile,
+                wait_for_reply=True,
+                response_timeout=RESPONSE_TIMEOUT,
+            ),
+        )
+
+        # Update status message every 30s while waiting
+        elapsed = 0
+        while not conductor_future.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(conductor_future), timeout=30)
+            except asyncio.TimeoutError:
+                elapsed += 30
+                try:
+                    await status_msg.edit_text(
+                        f"{profile_tag}Still working... ({elapsed}s elapsed)"
+                    )
+                except Exception:
+                    pass
+
+        ok, response = conductor_future.result()
+
+        if not ok:
+            try:
+                await status_msg.edit_text(
+                    f"{profile_tag}Failed to get response from conductor."
+                )
+            except Exception:
+                await message.answer(
+                    f"[Failed to send message to conductor [{target_profile}].]"
+                )
+            return
+
         log.info("Conductor [%s] response: %s", target_profile, response[:100])
 
-        # Send response back (split if needed)
-        for chunk in split_message(response):
-            prefixed = f"{profile_tag}{chunk}" if profile_tag else chunk
-            await message.answer(prefixed)
+        # Convert Markdown to Telegram HTML and send
+        html_response = md_to_telegram_mdv2(response)
+        chunks = split_message(html_response)
+        if chunks:
+            first = f"{profile_tag}{chunks[0]}" if profile_tag else chunks[0]
+            try:
+                await status_msg.edit_text(first, parse_mode="MarkdownV2")
+            except Exception:
+                try:
+                    await status_msg.edit_text(first)
+                except Exception:
+                    await message.answer(first)
+            for chunk in chunks[1:]:
+                prefixed = f"{profile_tag}{chunk}" if profile_tag else chunk
+                try:
+                    await message.answer(prefixed, parse_mode="MarkdownV2")
+                except Exception:
+                    await message.answer(prefixed)
 
     return bot, dp
 

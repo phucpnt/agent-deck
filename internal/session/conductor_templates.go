@@ -763,6 +763,72 @@ def parse_conductor_prefix(text: str, conductor_names: list[str]) -> tuple[str |
 # ---------------------------------------------------------------------------
 
 
+BT = chr(96)  # backtick char, avoid literal in Go raw string
+_MDV2_CHARS = frozenset("_*[]()~>#+-=|{}.!" + BT)
+
+
+def _escape_mdv2(text: str) -> str:
+    """Escape MarkdownV2 special characters."""
+    return "".join("\\" + c if c in _MDV2_CHARS else c for c in text)
+
+
+def _escape_mdv2_code(text: str) -> str:
+    """Escape inside MarkdownV2 code blocks."""
+    return text.replace("\\", "\\\\").replace(BT, "\\" + BT)
+
+
+def md_to_telegram_mdv2(text: str) -> str:
+    """Convert standard Markdown to Telegram MarkdownV2."""
+    BT3 = BT * 3
+
+    # 1. Extract fenced code blocks (protect from general escaping)
+    code_blocks = []
+    code_block_re = re.compile(
+        rf"{BT3}(\w*)\n(.*?)\n{BT3}", re.DOTALL
+    )
+
+    def _save_code_block(m):
+        lang = m.group(1)
+        code = _escape_mdv2_code(m.group(2))
+        idx = len(code_blocks)
+        block = f"{BT3}{lang}\n{code}\n{BT3}" if lang else f"{BT3}\n{code}\n{BT3}"
+        code_blocks.append(block)
+        return f"\x00CB{idx}\x00"
+
+    text = code_block_re.sub(_save_code_block, text)
+
+    # 2. Extract inline code
+    inline_codes = []
+    inline_re = re.compile(rf"{BT}([^{BT}\n]+){BT}")
+
+    def _save_inline(m):
+        code = _escape_mdv2_code(m.group(1))
+        idx = len(inline_codes)
+        inline_codes.append(f"{BT}{code}{BT}")
+        return f"\x00IC{idx}\x00"
+
+    text = inline_re.sub(_save_inline, text)
+
+    # 3. Escape all MarkdownV2 special chars
+    text = _escape_mdv2(text)
+
+    # 4. Convert escaped Markdown patterns to MarkdownV2 formatting
+    text = re.sub(r"\\\*\\\*(.+?)\\\*\\\*", r"*\1*", text)
+    text = re.sub(r"\\\*([^\n]+?)\\\*", r"_\1_", text)
+    text = re.sub(r"^(?:\\\#)+\s+(.+)$", r"*\1*", text, flags=re.MULTILINE)
+    text = re.sub(r"^(?:\\\-){3,}$", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\\\- ", "\u2022 ", text, flags=re.MULTILINE)
+
+    # 5. Restore protected blocks
+    for i, block in enumerate(code_blocks):
+        text = text.replace(f"\x00CB{i}\x00", block)
+    for i, code in enumerate(inline_codes):
+        text = text.replace(f"\x00IC{i}\x00", code)
+
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
 def split_message(text: str, max_len: int = TG_MAX_LENGTH) -> list[str]:
     """Split a long message into chunks that fit the platform limit."""
     if len(text) <= max_len:
@@ -1032,34 +1098,75 @@ def create_telegram_bot(config: dict):
             )
             return
 
-        # Send to conductor
+        # Send to conductor with progress updates
         log.info(
             "User message -> [%s]: %s", target["name"], cleaned_msg[:100]
         )
-        ok, response = send_to_conductor(
-            session_title,
-            cleaned_msg,
-            profile=profile,
-            wait_for_reply=True,
-            response_timeout=RESPONSE_TIMEOUT,
-        )
-        if not ok:
-            await message.answer(
-                f"[Failed to send message to conductor {target['name']}.]"
-            )
-            return
-
-        # Response is returned directly by session send --wait.
         name_tag = (
             f"[{target['name']}] " if len(conductors) > 1 else ""
         )
-        await message.answer(f"{name_tag}...")  # typing indicator
+        status_msg = await message.answer(f"{name_tag}Working on it...")
+
+        # Run blocking CLI call in a thread so we can update progress
+        loop = asyncio.get_event_loop()
+        conductor_future = loop.run_in_executor(
+            None,
+            lambda: send_to_conductor(
+                session_title,
+                cleaned_msg,
+                profile=profile,
+                wait_for_reply=True,
+                response_timeout=RESPONSE_TIMEOUT,
+            ),
+        )
+
+        # Update status message every 30s while waiting
+        elapsed = 0
+        while not conductor_future.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(conductor_future), timeout=30)
+            except asyncio.TimeoutError:
+                elapsed += 30
+                try:
+                    await status_msg.edit_text(
+                        f"{name_tag}Still working... ({elapsed}s elapsed)"
+                    )
+                except Exception:
+                    pass  # edit may fail if message unchanged
+
+        ok, response = conductor_future.result()
+
+        if not ok:
+            try:
+                await status_msg.edit_text(
+                    f"{name_tag}Failed to get response from conductor."
+                )
+            except Exception:
+                await message.answer(
+                    f"[Failed to send message to conductor {target['name']}.]"
+                )
+            return
+
         log.info("Conductor [%s] response: %s", target["name"], response[:100])
 
-        # Send response back (split if needed)
-        for chunk in split_message(response):
-            prefixed = f"{name_tag}{chunk}" if name_tag else chunk
-            await message.answer(prefixed)
+        # Convert Markdown to Telegram HTML and send
+        html_response = md_to_telegram_mdv2(response)
+        chunks = split_message(html_response)
+        if chunks:
+            first = f"{name_tag}{chunks[0]}" if name_tag else chunks[0]
+            try:
+                await status_msg.edit_text(first, parse_mode="MarkdownV2")
+            except Exception:
+                try:
+                    await status_msg.edit_text(first)
+                except Exception:
+                    await message.answer(first)
+            for chunk in chunks[1:]:
+                prefixed = f"{name_tag}{chunk}" if name_tag else chunk
+                try:
+                    await message.answer(prefixed, parse_mode="MarkdownV2")
+                except Exception:
+                    await message.answer(prefixed)
 
     return bot, dp
 
