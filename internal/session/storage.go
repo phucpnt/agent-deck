@@ -75,12 +75,27 @@ type InstanceData struct {
 
 	// Latest user input for context
 	LatestPrompt string `json:"latest_prompt,omitempty"`
+	Notes        string `json:"notes,omitempty"`
 
 	// Tool-specific launch options (generic for all tools: claude, codex, etc.)
 	ToolOptionsJSON json.RawMessage `json:"tool_options,omitempty"`
 
 	// MCP tracking (persisted for sync status display)
 	LoadedMCPNames []string `json:"loaded_mcp_names,omitempty"`
+
+	// Sandbox support
+	Sandbox          *SandboxConfig `json:"sandbox,omitempty"`
+	SandboxContainer string         `json:"sandbox_container,omitempty"`
+
+	// SSH remote support
+	SSHHost       string `json:"ssh_host,omitempty"`
+	SSHRemotePath string `json:"ssh_remote_path,omitempty"`
+
+	// Multi-repo support
+	MultiRepoEnabled   bool                            `json:"multi_repo_enabled,omitempty"`
+	AdditionalPaths    []string                        `json:"additional_paths,omitempty"`
+	MultiRepoTempDir   string                          `json:"multi_repo_temp_dir,omitempty"`
+	MultiRepoWorktrees []statedb.MultiRepoWorktreeData `json:"multi_repo_worktrees,omitempty"`
 }
 
 // GroupData represents serializable group data
@@ -253,15 +268,36 @@ func (s *Storage) SaveWithGroups(instances []*Instance, groupTree *GroupTree) er
 		if inst.tmuxSession != nil {
 			tmuxName = inst.tmuxSession.Name
 		}
+		var sandboxJSON json.RawMessage
+		if inst.Sandbox != nil {
+			data, err := json.Marshal(inst.Sandbox)
+			if err != nil {
+				return fmt.Errorf("failed to marshal sandbox for %s: %w", inst.ID, err)
+			}
+			sandboxJSON = data
+		}
 
+		var mrWorktrees []statedb.MultiRepoWorktreeData
+		for _, wt := range inst.MultiRepoWorktrees {
+			mrWorktrees = append(mrWorktrees, statedb.MultiRepoWorktreeData{
+				OriginalPath: wt.OriginalPath,
+				WorktreePath: wt.WorktreePath,
+				RepoRoot:     wt.RepoRoot,
+				Branch:       wt.Branch,
+			})
+		}
 		toolData := statedb.MarshalToolData(
 			inst.ClaudeSessionID, inst.ClaudeDetectedAt,
 			inst.GeminiSessionID, inst.GeminiDetectedAt,
 			inst.GeminiYoloMode, inst.GeminiModel,
 			inst.OpenCodeSessionID, inst.OpenCodeDetectedAt,
 			inst.CodexSessionID, inst.CodexDetectedAt,
-			inst.LatestPrompt, inst.LoadedMCPNames,
+			inst.LatestPrompt, inst.Notes, inst.LoadedMCPNames,
 			inst.ToolOptionsJSON,
+			sandboxJSON, inst.SandboxContainer,
+			inst.SSHHost, inst.SSHRemotePath,
+			inst.MultiRepoEnabled, inst.AdditionalPaths,
+			inst.MultiRepoTempDir, mrWorktrees,
 		)
 
 		rows[i] = &statedb.InstanceRow{
@@ -400,8 +436,13 @@ func (s *Storage) LoadLite() ([]*InstanceData, []*GroupData, error) {
 			geminiYolo, geminiModel,
 			opencodeSID, opencodeAt,
 			codexSID, codexAt,
-			latestPrompt, loadedMCPs,
-			toolOpts := statedb.UnmarshalToolData(r.ToolData)
+			latestPrompt, notes, loadedMCPs,
+			toolOpts,
+			sandboxJSON, sandboxContainer,
+			sshHost2, sshRemotePath2,
+			mrEnabled2, addPaths2,
+			mrTempDir2, mrWorktrees2 := statedb.UnmarshalToolData(r.ToolData)
+		sandboxCfg := decodeSandboxConfig(sandboxJSON)
 
 		instances[i] = &InstanceData{
 			ID:                 r.ID,
@@ -431,8 +472,17 @@ func (s *Storage) LoadLite() ([]*InstanceData, []*GroupData, error) {
 			CodexSessionID:     codexSID,
 			CodexDetectedAt:    codexAt,
 			LatestPrompt:       latestPrompt,
+			Notes:              notes,
 			ToolOptionsJSON:    toolOpts,
 			LoadedMCPNames:     loadedMCPs,
+			Sandbox:            sandboxCfg,
+			SandboxContainer:   sandboxContainer,
+			SSHHost:            sshHost2,
+			SSHRemotePath:      sshRemotePath2,
+			MultiRepoEnabled:   mrEnabled2,
+			AdditionalPaths:    addPaths2,
+			MultiRepoTempDir:   mrTempDir2,
+			MultiRepoWorktrees: mrWorktrees2,
 		}
 	}
 
@@ -482,8 +532,13 @@ func (s *Storage) LoadWithGroups() ([]*Instance, []*GroupData, error) {
 			geminiYolo, geminiModel,
 			opencodeSID, opencodeAt,
 			codexSID, codexAt,
-			latestPrompt, loadedMCPs,
-			toolOpts := statedb.UnmarshalToolData(r.ToolData)
+			latestPrompt, notes, loadedMCPs,
+			toolOpts,
+			sandboxJSON, sandboxContainer,
+			sshHost, sshRemotePath,
+			mrEnabled, addPaths,
+			mrTempDir, mrWorktrees := statedb.UnmarshalToolData(r.ToolData)
+		sandboxCfg := decodeSandboxConfig(sandboxJSON)
 
 		data.Instances[i] = &InstanceData{
 			ID:                 r.ID,
@@ -513,8 +568,17 @@ func (s *Storage) LoadWithGroups() ([]*Instance, []*GroupData, error) {
 			CodexSessionID:     codexSID,
 			CodexDetectedAt:    codexAt,
 			LatestPrompt:       latestPrompt,
+			Notes:              notes,
 			ToolOptionsJSON:    toolOpts,
 			LoadedMCPNames:     loadedMCPs,
+			Sandbox:            sandboxCfg,
+			SandboxContainer:   sandboxContainer,
+			SSHHost:            sshHost,
+			SSHRemotePath:      sshRemotePath,
+			MultiRepoEnabled:   mrEnabled,
+			AdditionalPaths:    addPaths,
+			MultiRepoTempDir:   mrTempDir,
+			MultiRepoWorktrees: mrWorktrees,
 		}
 	}
 
@@ -664,7 +728,7 @@ func (s *Storage) convertToInstances(data *StorageData) ([]*Instance, []*GroupDa
 			// Pass instance ID for activity hooks (enables real-time status updates)
 			tmuxSess.InstanceID = instData.ID
 			tmuxSess.SetInjectStatusLine(GetTmuxSettings().GetInjectStatusLine())
-			// Note: EnableMouseMode is now deferred to EnsureConfigured()
+			// Note: EnableMouseMode and ConfigureStatusBar are deferred to EnsureConfigured()
 			// Called automatically when user attaches to session
 		}
 
@@ -707,8 +771,31 @@ func (s *Storage) convertToInstances(data *StorageData) ([]*Instance, []*GroupDa
 			CodexDetectedAt:    instData.CodexDetectedAt,
 			ToolOptionsJSON:    instData.ToolOptionsJSON,
 			LatestPrompt:       instData.LatestPrompt,
+			Notes:              instData.Notes,
 			LoadedMCPNames:     instData.LoadedMCPNames,
+			Sandbox:            instData.Sandbox,
+			SandboxContainer:   instData.SandboxContainer,
+			SSHHost:            instData.SSHHost,
+			SSHRemotePath:      instData.SSHRemotePath,
+			MultiRepoEnabled:   instData.MultiRepoEnabled,
+			AdditionalPaths:    instData.AdditionalPaths,
+			MultiRepoTempDir:   instData.MultiRepoTempDir,
 			tmuxSession:        tmuxSess,
+		}
+		// Convert multi-repo worktree data
+		for _, wt := range instData.MultiRepoWorktrees {
+			inst.MultiRepoWorktrees = append(inst.MultiRepoWorktrees, MultiRepoWorktree{
+				OriginalPath: wt.OriginalPath,
+				WorktreePath: wt.WorktreePath,
+				RepoRoot:     wt.RepoRoot,
+				Branch:       wt.Branch,
+			})
+		}
+
+		// Set tmux option overrides so EnsureConfigured/ConfigureStatusBar
+		// respects user-defined keys (e.g. status = "2" for multi-line bar).
+		if tmuxSess != nil {
+			tmuxSess.OptionOverrides = inst.buildTmuxOptionOverrides()
 		}
 
 		// PERFORMANCE: Skip UpdateStatus at load time - use cached status from SQLite
@@ -736,7 +823,21 @@ func statusToString(s Status) string {
 		return "idle"
 	case StatusError:
 		return "waiting" // Treat errors as needing attention
+	case StatusStopped:
+		return "inactive" // Stopped sessions are intentionally inactive
 	default:
 		return "waiting"
 	}
+}
+
+func decodeSandboxConfig(data json.RawMessage) *SandboxConfig {
+	if len(data) == 0 {
+		return nil
+	}
+
+	var cfg SandboxConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return nil
+	}
+	return &cfg
 }

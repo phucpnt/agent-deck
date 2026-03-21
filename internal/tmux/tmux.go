@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -20,14 +21,82 @@ import (
 
 	"golang.org/x/sync/singleflight"
 
+	"github.com/BurntSushi/toml"
 	"github.com/asheshgoplani/agent-deck/internal/logging"
+	"github.com/asheshgoplani/agent-deck/internal/platform"
+	dark "github.com/thiagokokada/dark-mode-go"
 )
 
 var (
 	statusLog  = logging.ForComponent(logging.CompStatus)
 	respawnLog = logging.ForComponent(logging.CompSession)
 	mcpLog     = logging.ForComponent(logging.CompMCP)
+	perfLog    = logging.ForComponent(logging.CompPerf)
 )
+
+type tmuxThemeStyle struct {
+	windowStyle       string
+	windowActiveStyle string
+	statusStyle       string
+	hintColor         string
+}
+
+func resolvedAgentDeckTheme() string {
+	type cfg struct {
+		Theme string `toml:"theme"`
+	}
+	home, err := os.UserHomeDir()
+	if err == nil {
+		var c cfg
+		if _, err := toml.DecodeFile(filepath.Join(home, ".agent-deck", "config.toml"), &c); err == nil {
+			switch c.Theme {
+			case "light", "dark":
+				return c.Theme
+			case "system", "":
+				// fall through to OS detection
+			default:
+				return "dark"
+			}
+		}
+	}
+	isDark, err := dark.IsDarkMode()
+	if err != nil {
+		return "dark"
+	}
+	if isDark {
+		return "dark"
+	}
+	return "light"
+}
+
+func currentTmuxThemeStyle() tmuxThemeStyle {
+	if resolvedAgentDeckTheme() == "light" {
+		return tmuxThemeStyle{
+			// Light terminals can still inherit a dark-looking tmux window background
+			// when we leave window-style at "default". Use an explicit neutral light
+			// background so the attached client sees and renders against a light pane.
+			windowStyle:       "bg=#f9f9f9",
+			windowActiveStyle: "bg=#f9f9f9",
+			statusStyle:       "bg=#e9e9ec,fg=#343b58",
+			hintColor:         "#6a6d7c",
+		}
+	}
+	return tmuxThemeStyle{
+		// Preserve the historical dark behavior unless a light theme is active.
+		windowStyle:       "default",
+		windowActiveStyle: "default",
+		statusStyle:       "bg=#1a1b26,fg=#a9b1d6",
+		hintColor:         "#565f89",
+	}
+}
+
+func (s *Session) themedStatusRight(themeStyle tmuxThemeStyle) string {
+	folderName := filepath.Base(s.WorkDir)
+	if folderName == "" || folderName == "." {
+		folderName = "~"
+	}
+	return fmt.Sprintf("#[fg=%s]ctrl+q detach#[default] │ 📁 %s | %s ", themeStyle.hintColor, s.DisplayName, folderName)
+}
 
 // ErrCaptureTimeout is returned when CapturePane exceeds its timeout.
 // Callers should preserve previous state rather than transitioning to error/inactive.
@@ -54,13 +123,21 @@ var (
 // when there's actual terminal output, while session_activity only updates on
 // session-level events. This is critical for detecting when Claude is actively working.
 func RefreshSessionCache() {
+	finish := logging.TraceOp(perfLog, "refresh_session_cache", 100*time.Millisecond)
+	defer finish()
+
 	// Try control mode pipe first (zero subprocess)
 	if pm := GetPipeManager(); pm != nil {
-		if activities, err := pm.RefreshAllActivities(); err == nil && len(activities) > 0 {
+		if activities, windows, err := pm.RefreshAllActivities(); err == nil && len(activities) > 0 {
 			sessionCacheMu.Lock()
 			sessionCacheData = activities
 			sessionCacheTime = time.Now()
 			sessionCacheMu.Unlock()
+
+			windowCacheMu.Lock()
+			windowCacheData = windows
+			windowCacheTime = time.Now()
+			windowCacheMu.Unlock()
 			return
 		}
 		// Pipe failed: log it so we can verify zero subprocess usage
@@ -68,7 +145,7 @@ func RefreshSessionCache() {
 	}
 
 	// Subprocess fallback: list-windows -a
-	cmd := exec.Command("tmux", "list-windows", "-a", "-F", "#{session_name}\t#{window_activity}")
+	cmd := exec.Command("tmux", "list-windows", "-a", "-F", "#{session_name}\t#{window_activity}\t#{window_index}\t#{window_name}")
 	output, err := cmd.Output()
 	if err != nil {
 		sessionCacheMu.Lock()
@@ -78,28 +155,56 @@ func RefreshSessionCache() {
 		return
 	}
 
-	newCache := make(map[string]int64)
-	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+	newSessionCache, newWindowCache := parseListWindowsOutput(string(output))
+
+	sessionCacheMu.Lock()
+	sessionCacheData = newSessionCache
+	sessionCacheTime = time.Now()
+	sessionCacheMu.Unlock()
+
+	windowCacheMu.Lock()
+	windowCacheData = newWindowCache
+	windowCacheTime = time.Now()
+	windowCacheMu.Unlock()
+}
+
+// parseListWindowsOutput parses the output of `tmux list-windows -a` with the extended format
+// "#{session_name}\t#{window_activity}\t#{window_index}\t#{window_name}"
+// Returns session-level max activity and per-session window info.
+func parseListWindowsOutput(output string) (map[string]int64, map[string][]WindowInfo) {
+	sessionCache := make(map[string]int64)
+	windowCache := make(map[string][]WindowInfo)
+
+	for _, line := range strings.Split(strings.TrimSpace(output), "\n") {
 		if line == "" {
 			continue
 		}
-		parts := strings.SplitN(line, "\t", 2)
-		if len(parts) != 2 {
+		parts := strings.SplitN(line, "\t", 4)
+		if len(parts) < 2 {
 			continue
 		}
 		name := parts[0]
 		var activity int64
-		_, _ = fmt.Sscanf(parts[1], "%d", &activity) // ignore error, 0 is valid default
-		// Keep maximum activity (most recent) if session has multiple windows
-		if existing, ok := newCache[name]; !ok || activity > existing {
-			newCache[name] = activity
+		_, _ = fmt.Sscanf(parts[1], "%d", &activity)
+
+		// Session-level: keep max activity
+		if existing, ok := sessionCache[name]; !ok || activity > existing {
+			sessionCache[name] = activity
+		}
+
+		// Window-level: only if we have index and name fields
+		if len(parts) == 4 {
+			var idx int
+			_, _ = fmt.Sscanf(parts[2], "%d", &idx)
+			windowCache[name] = append(windowCache[name], WindowInfo{
+				Index:    idx,
+				Name:     parts[3],
+				Activity: activity,
+			})
 		}
 	}
 
-	sessionCacheMu.Lock()
-	sessionCacheData = newCache
-	sessionCacheTime = time.Now()
-	sessionCacheMu.Unlock()
+	return sessionCache, windowCache
 }
 
 // RefreshExistingSessions is an alias for RefreshSessionCache for backwards compatibility
@@ -323,7 +428,7 @@ func SupportsHyperlinks() bool {
 }
 
 // Tool detection patterns (used by DetectTool for initial tool identification)
-var toolDetectionOrder = []string{"claude", "gemini", "opencode", "codex"}
+var toolDetectionOrder = []string{"claude", "gemini", "opencode", "codex", "pi"}
 
 var toolDetectionPatterns = map[string][]*regexp.Regexp{
 	"claude": {
@@ -344,10 +449,36 @@ var toolDetectionPatterns = map[string][]*regexp.Regexp{
 		regexp.MustCompile(`(?i)codex`),
 		regexp.MustCompile(`(?i)openai`),
 	},
+	"pi": {
+		regexp.MustCompile(`(?mi)^\s*pi>\s*`),
+		regexp.MustCompile(`(?i)\bpi\s+cli\b`),
+		regexp.MustCompile(`(?i)\bpi\s+code\b`),
+	},
 }
 
 func detectToolFromCommand(command string) string {
 	cmdLower := strings.ToLower(strings.TrimSpace(command))
+	if cmdLower == "" {
+		return ""
+	}
+
+	fields := strings.Fields(cmdLower)
+	if len(fields) > 0 {
+		base := filepath.Base(fields[0])
+		switch base {
+		case "claude":
+			return "claude"
+		case "gemini":
+			return "gemini"
+		case "opencode", "open-code":
+			return "opencode"
+		case "codex":
+			return "codex"
+		case "pi":
+			return "pi"
+		}
+	}
+
 	switch {
 	case strings.Contains(cmdLower, "claude"):
 		return "claude"
@@ -357,6 +488,8 @@ func detectToolFromCommand(command string) string {
 		return "opencode"
 	case strings.Contains(cmdLower, "codex"):
 		return "codex"
+	case strings.Contains(cmdLower, " pi ") || strings.HasPrefix(cmdLower, "pi "):
+		return "pi"
 	default:
 		return ""
 	}
@@ -854,6 +987,21 @@ func (s *Session) SetEnvironment(key, value string) error {
 	return err
 }
 
+func (s *Session) ApplyThemeOptions() error {
+	themeStyle := currentTmuxThemeStyle()
+	args := []string{
+		"set-option", "-t", s.Name, "window-style", themeStyle.windowStyle, ";",
+		"set-option", "-t", s.Name, "window-active-style", themeStyle.windowActiveStyle, ";",
+		"set-option", "-t", s.Name, "status-style", themeStyle.statusStyle,
+	}
+	if s.injectStatusLine {
+		args = append(args,
+			";", "set-option", "-t", s.Name, "status-right", s.themedStatusRight(themeStyle),
+		)
+	}
+	return exec.Command("tmux", args...).Run()
+}
+
 // GetEnvironment gets an environment variable from this tmux session.
 // Uses a 30-second cache to avoid spawning tmux show-environment subprocesses
 // on every poll cycle. Call InvalidateEnvCache() after SetEnvironment to clear.
@@ -898,11 +1046,110 @@ func (s *Session) InvalidateEnvCache() {
 	s.envCacheMu.Unlock()
 }
 
+// sanitizeNameRe matches characters not allowed in tmux session names.
+var sanitizeNameRe = regexp.MustCompile(`[^a-zA-Z0-9-]+`)
+
 // sanitizeName converts a display name to a valid tmux session name
 func sanitizeName(name string) string {
 	// Replace spaces and special characters with hyphens
-	re := regexp.MustCompile(`[^a-zA-Z0-9-]+`)
-	return re.ReplaceAllString(name, "-")
+	return sanitizeNameRe.ReplaceAllString(name, "-")
+}
+
+func shouldRecoverFromTmuxStartError(output string) bool {
+	lower := strings.ToLower(output)
+	return strings.Contains(lower, "server exited unexpectedly") ||
+		strings.Contains(lower, "lost server")
+}
+
+func recoverFromStaleDefaultSocketIfNeeded(startErrOutput string) (bool, error) {
+	if !shouldRecoverFromTmuxStartError(startErrOutput) {
+		return false, nil
+	}
+
+	// If tmux can already answer list-sessions, don't touch any socket file.
+	if err := exec.Command("tmux", "list-sessions").Run(); err == nil {
+		return false, nil
+	}
+
+	for _, socketPath := range defaultTmuxSocketCandidates() {
+		info, err := os.Stat(socketPath)
+		if err != nil {
+			continue
+		}
+		if info.IsDir() {
+			continue
+		}
+		if isSocketAcceptingConnections(socketPath) {
+			continue
+		}
+
+		backupPath := fmt.Sprintf("%s.stale.%d", socketPath, time.Now().UnixNano())
+		if err := os.Rename(socketPath, backupPath); err != nil {
+			return false, fmt.Errorf("failed to quarantine stale tmux socket %s: %w", socketPath, err)
+		}
+
+		statusLog.Warn("tmux_stale_socket_recovered",
+			slog.String("socket", socketPath),
+			slog.String("backup", backupPath),
+		)
+		return true, nil
+	}
+
+	return false, nil
+}
+
+func defaultTmuxSocketCandidates() []string {
+	uid := os.Getuid()
+	if uid < 0 {
+		return nil
+	}
+
+	add := func(out []string, seen map[string]struct{}, p string) []string {
+		if p == "" {
+			return out
+		}
+		if _, ok := seen[p]; ok {
+			return out
+		}
+		seen[p] = struct{}{}
+		return append(out, p)
+	}
+
+	seen := make(map[string]struct{})
+	candidates := make([]string, 0, 5)
+	if tmuxPath := tmuxSocketPathFromEnv(); tmuxPath != "" {
+		candidates = add(candidates, seen, tmuxPath)
+	}
+
+	socketSuffix := filepath.Join(fmt.Sprintf("tmux-%d", uid), "default")
+	if tmuxTmp := os.Getenv("TMUX_TMPDIR"); tmuxTmp != "" {
+		candidates = add(candidates, seen, filepath.Join(tmuxTmp, socketSuffix))
+	}
+	candidates = add(candidates, seen, filepath.Join(os.TempDir(), socketSuffix))
+	candidates = add(candidates, seen, filepath.Join("/tmp", socketSuffix))
+	candidates = add(candidates, seen, filepath.Join("/private/tmp", socketSuffix))
+	return candidates
+}
+
+func tmuxSocketPathFromEnv() string {
+	raw := os.Getenv("TMUX")
+	if raw == "" {
+		return ""
+	}
+	parts := strings.Split(raw, ",")
+	if len(parts) == 0 {
+		return ""
+	}
+	return parts[0]
+}
+
+func isSocketAcceptingConnections(socketPath string) bool {
+	conn, err := net.DialTimeout("unix", socketPath, 200*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
 }
 
 // Start creates and starts a tmux session.
@@ -945,6 +1192,19 @@ func (s *Session) Start(command string) error {
 	cmd := exec.Command("tmux", args...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
+		if recovered, recoverErr := recoverFromStaleDefaultSocketIfNeeded(string(output)); recoverErr != nil {
+			statusLog.Warn("tmux_stale_socket_recovery_failed",
+				slog.String("session", s.Name),
+				slog.String("error", recoverErr.Error()),
+			)
+		} else if recovered {
+			statusLog.Warn("tmux_start_retry_after_socket_recovery",
+				slog.String("session", s.Name),
+			)
+			output, err = exec.Command("tmux", args...).CombinedOutput()
+		}
+	}
+	if err != nil {
 		return fmt.Errorf("failed to create tmux session: %w (output: %s)", err, string(output))
 	}
 
@@ -963,19 +1223,32 @@ func (s *Session) Start(command string) error {
 	// - set-clipboard on: Clipboard integration (Warp, iTerm2, kitty, etc.)
 	// - history-limit 10000: Large scrollback for AI agent output
 	// - escape-time 10: Fast Vim/editor responsiveness (default 500ms is too slow)
-	// - terminal-features hyperlinks: Track hyperlinks like colors (tmux 3.4+, server-wide)
+	// - extended-keys on: Forward Shift+Enter and other modified keys to apps (tmux 3.2+)
+	// - terminal-features hyperlinks+extkeys: Track hyperlinks and enable extended key reporting (tmux 3.4+, server-wide)
 	//
 	// Note: remain-on-exit is NOT set here — it is only enabled for sandbox sessions
 	// via OptionOverrides to avoid changing behaviour for non-sandbox sessions.
+	themeStyle := currentTmuxThemeStyle()
+
 	_ = exec.Command("tmux",
-		"set-option", "-t", s.Name, "window-style", "default", ";",
-		"set-option", "-t", s.Name, "window-active-style", "default", ";",
+		"set-option", "-t", s.Name, "window-style", themeStyle.windowStyle, ";",
+		"set-option", "-t", s.Name, "window-active-style", themeStyle.windowActiveStyle, ";",
 		"set-option", "-t", s.Name, "mouse", "on", ";",
 		"set-option", "-t", s.Name, "-q", "allow-passthrough", "on", ";",
 		"set-option", "-t", s.Name, "set-clipboard", "on", ";",
 		"set-option", "-t", s.Name, "history-limit", "10000", ";",
 		"set-option", "-t", s.Name, "escape-time", "10", ";",
-		"set", "-asq", "terminal-features", ",*:hyperlinks").Run()
+		"set-option", "-t", s.Name, "-q", "extended-keys", "on").Run()
+
+	// Idempotent: only append terminal-features if not already present
+	ensureTerminalFeatures("hyperlinks", "extkeys")
+
+	// Bind Ctrl+Q to detach at the tmux level as fallback for terminals where
+	// XON/XOFF flow control intercepts the key before it reaches the PTY stdin
+	// reader (e.g. iTerm2 on macOS). Only binds on agentdeck-managed sessions.
+	_ = exec.Command("tmux", "bind-key", "-n", "-T", "root", "C-q",
+		"if-shell", fmt.Sprintf("[ \"#{session_name}\" = \"%s\" ]", s.Name),
+		"detach-client", "").Run()
 
 	// Apply user-specified tmux option overrides from config (after defaults).
 	// These are batched into a single call when multiple overrides are present.
@@ -995,6 +1268,25 @@ func (s *Session) Start(command string) error {
 	// Configure status bar with session info for easy identification
 	// Shows: session title on left, project folder on right
 	s.ConfigureStatusBar()
+
+	// Wait for the pane shell to be ready before sending the command via send-keys.
+	// On WSL/Linux non-interactive contexts, pane initialisation can take 100-500ms and
+	// sending keys before the shell is ready causes them to be silently swallowed.
+	// Non-fatal best-effort guard: if the timeout expires, log a warning and continue
+	// anyway (degraded path, same as the behaviour before this guard was added).
+	if command != "" && !startWithInitialProcess {
+		paneReadyTimeout := 2 * time.Second
+		if platform.IsWSL() {
+			paneReadyTimeout = 5 * time.Second
+		}
+		if err := waitForPaneReady(s, paneReadyTimeout); err != nil {
+			statusLog.Warn("pane_ready_timeout",
+				slog.String("session", s.Name),
+				slog.String("timeout", paneReadyTimeout.String()),
+				slog.String("error", err.Error()),
+			)
+		}
+	}
 
 	// Legacy behavior for non-sandbox sessions: start shell first, then send command.
 	if command != "" && !startWithInitialProcess {
@@ -1066,37 +1358,81 @@ func (s *Session) IsPaneDead() bool {
 	return strings.TrimSpace(string(out)) == "1"
 }
 
-// ConfigureStatusBar sets up the tmux status bar with session info
-// Shows: notification bar on left (managed by NotificationManager), session info on right
-// NOTE: status-left is reserved for the notification bar showing waiting sessions
-// This function only configures status-right to avoid overwriting notification bar
-func (s *Session) ConfigureStatusBar() {
-	// Skip status bar injection if disabled by user config
+// buildStatusBarArgs returns the tmux command args for configuring the status bar.
+// Returns nil if status bar injection is disabled.
+// Skips any option key that exists in s.OptionOverrides — user-defined options take precedence.
+func (s *Session) buildStatusBarArgs() []string {
 	if !s.injectStatusLine {
+		return nil
+	}
+	themeStyle := currentTmuxThemeStyle()
+	rightStatus := s.themedStatusRight(themeStyle)
+
+	// Managed defaults — each can be skipped if user defined it in [tmux] options
+	type option struct {
+		key   string
+		value string
+	}
+	defaults := []option{
+		{"status", "on"},
+		{"status-style", themeStyle.statusStyle},
+		{"status-left-length", "120"},
+		{"status-right", rightStatus},
+		{"status-right-length", "80"},
+	}
+
+	var args []string
+	for _, opt := range defaults {
+		if _, overridden := s.OptionOverrides[opt.key]; overridden {
+			continue
+		}
+		if len(args) > 0 {
+			args = append(args, ";")
+		}
+		args = append(args, "set-option", "-t", s.Name, opt.key, opt.value)
+	}
+
+	if len(args) == 0 {
+		return nil
+	}
+	return args
+}
+
+// ConfigureStatusBar sets up the tmux status bar with session info.
+// Shows: notification bar on left (managed by NotificationManager), session info on right.
+// NOTE: status-left is reserved for the notification bar showing waiting sessions.
+// Options defined in [tmux] options are respected — agent-deck skips those keys.
+func (s *Session) ConfigureStatusBar() {
+	args := s.buildStatusBarArgs()
+	if args == nil {
 		return
 	}
+	_ = exec.Command("tmux", args...).Run()
+}
 
-	// Get short folder name from WorkDir
-	folderName := filepath.Base(s.WorkDir)
-	if folderName == "" || folderName == "." {
-		folderName = "~"
+// ensureTerminalFeatures appends terminal features only if not already present.
+// This prevents the terminal-features list from growing on every session start (#366).
+func ensureTerminalFeatures(features ...string) {
+	out, err := exec.Command("tmux", "show", "-sv", "terminal-features").Output()
+	if err != nil {
+		// tmux too old or server not running — append unconditionally as best-effort
+		if len(features) > 0 {
+			val := ",*:" + strings.Join(features, ":")
+			_ = exec.Command("tmux", "set", "-asq", "terminal-features", val).Run()
+		}
+		return
 	}
-
-	// Right side: detach hint + session title with folder path
-	// The hint uses subtle gray (#565f89) so it doesn't compete with session info
-	rightStatus := fmt.Sprintf("#[fg=#565f89]ctrl+q detach#[default] │ 📁 %s | %s ", s.DisplayName, folderName)
-
-	// PERFORMANCE: Batch all 5 status bar options into single subprocess call
-	// Uses tmux command chaining with \; separator (73% reduction in subprocess calls)
-	// Before: 5 separate exec.Command calls = 5 subprocess spawns
-	// After: 1 exec.Command call = 1 subprocess spawn
-	cmd := exec.Command("tmux",
-		"set-option", "-t", s.Name, "status", "on", ";",
-		"set-option", "-t", s.Name, "status-style", "bg=#1a1b26,fg=#a9b1d6", ";",
-		"set-option", "-t", s.Name, "status-left-length", "120", ";",
-		"set-option", "-t", s.Name, "status-right", rightStatus, ";",
-		"set-option", "-t", s.Name, "status-right-length", "80")
-	_ = cmd.Run()
+	existing := string(out)
+	var missing []string
+	for _, f := range features {
+		if !strings.Contains(existing, f) {
+			missing = append(missing, f)
+		}
+	}
+	if len(missing) > 0 {
+		val := ",*:" + strings.Join(missing, ":")
+		_ = exec.Command("tmux", "set", "-asq", "terminal-features", val).Run()
+	}
 }
 
 // EnableMouseMode enables mouse scrolling, clipboard integration, and optimal settings
@@ -1132,7 +1468,8 @@ func (s *Session) EnableMouseMode() error {
 	// Enhancements included:
 	// - set-clipboard on: OSC 52 clipboard integration (Warp, iTerm2, kitty, etc.)
 	// - allow-passthrough on: OSC 8 hyperlinks, advanced escape sequences (tmux 3.2+)
-	// - terminal-features hyperlinks: Track hyperlinks like colors (tmux 3.4+)
+	// - extended-keys on: Forward Shift+Enter and other modified keys to apps (tmux 3.2+)
+	// - terminal-features hyperlinks+extkeys: Track hyperlinks and enable extended key reporting (tmux 3.4+)
 	// - history-limit 10000: Large scrollback for AI agent output
 	// - escape-time 10: Fast Vim/editor responsiveness (default 500ms is too slow)
 	//
@@ -1142,10 +1479,13 @@ func (s *Session) EnableMouseMode() error {
 		"set-option", "-t", s.Name, "-q", "allow-passthrough", "on", ";",
 		"set-option", "-t", s.Name, "history-limit", "10000", ";",
 		"set-option", "-t", s.Name, "escape-time", "10", ";",
-		"set", "-asq", "terminal-features", ",*:hyperlinks")
+		"set-option", "-t", s.Name, "-q", "extended-keys", "on")
 	// Ignore errors - all these are non-fatal enhancements
 	// Older tmux versions may not support some options
 	_ = enhanceCmd.Run()
+
+	// Idempotent: only append terminal-features if not already present
+	ensureTerminalFeatures("hyperlinks", "extkeys")
 
 	return nil
 }
@@ -1466,6 +1806,7 @@ func (s *Session) CapturePane() (string, error) {
 	if s.cacheContent != "" && time.Since(s.cacheTime) < 500*time.Millisecond {
 		content := s.cacheContent
 		s.cacheMu.RUnlock()
+		logging.Aggregate(logging.CompPerf, "capture_pane_cache_hit", slog.String("session", s.Name))
 		return content, nil
 	}
 	s.cacheMu.RUnlock()
@@ -1483,11 +1824,15 @@ func (s *Session) CapturePane() (string, error) {
 
 		// Try control mode pipe first (zero subprocess)
 		if pm := GetPipeManager(); pm != nil {
+			pipeStart := time.Now()
 			if content, pipeErr := pm.CapturePane(s.Name); pipeErr == nil {
 				s.cacheMu.Lock()
 				s.cacheContent = content
 				s.cacheTime = time.Now()
 				s.cacheMu.Unlock()
+				logging.Aggregate(logging.CompPerf, "capture_pane_pipe",
+					slog.String("session", s.Name),
+					slog.Duration("elapsed", time.Since(pipeStart)))
 				return content, nil
 			}
 			// Pipe failed: log it so we can verify zero subprocess usage
@@ -1495,10 +1840,13 @@ func (s *Session) CapturePane() (string, error) {
 		}
 
 		// Subprocess fallback: 3s timeout
+		finish := logging.TraceOp(perfLog, "capture_pane_subprocess", 200*time.Millisecond,
+			slog.String("session", s.Name))
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
 		cmd := exec.CommandContext(ctx, "tmux", "capture-pane", "-t", s.Name, "-p", "-e")
 		output, err := cmd.Output()
+		finish()
 		if err != nil {
 			if ctx.Err() == context.DeadlineExceeded {
 				return "", ErrCaptureTimeout
@@ -1544,6 +1892,7 @@ func (s *Session) CapturePaneFresh() (string, error) {
 	s.cacheContent = content
 	s.cacheTime = time.Now()
 	s.cacheMu.Unlock()
+
 	return content, nil
 }
 
@@ -1555,6 +1904,17 @@ func (s *Session) CaptureFullHistory() (string, error) {
 	output, err := cmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("failed to capture history: %w", err)
+	}
+	return string(output), nil
+}
+
+// CaptureWindowFullHistory captures the scrollback history of a specific window (last 2000 lines).
+func (s *Session) CaptureWindowFullHistory(windowIndex int) (string, error) {
+	target := fmt.Sprintf("%s:%d", s.Name, windowIndex)
+	cmd := exec.Command("tmux", "capture-pane", "-t", target, "-p", "-e", "-S", "-2000")
+	output, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("failed to capture window %d history: %w", windowIndex, err)
 	}
 	return string(output), nil
 }
@@ -1708,6 +2068,10 @@ func (s *Session) AcknowledgeWithSnapshot() {
 // 5. Cooldown expired → YELLOW or GRAY based on acknowledged
 
 func (s *Session) GetStatus() (string, error) {
+	finish := logging.TraceOp(perfLog, "get_status", 100*time.Millisecond,
+		slog.String("session", s.Name))
+	defer finish()
+
 	shortName := s.DisplayName
 	if len(shortName) > 12 {
 		shortName = shortName[:12]
@@ -3562,6 +3926,19 @@ func UnbindKey(key string) error {
 	// bind-key 1 select-window -t :1
 	_ = exec.Command("tmux", "bind-key", key, "select-window", "-t", ":"+key).Run()
 	return nil
+}
+
+// BindMouseStatusRightDetach binds a mouse click on the status-right area to detach.
+// Only fires inside agentdeck sessions (guards against detaching the user's outer tmux).
+func BindMouseStatusRightDetach() error {
+	// Guard: only detach if current session is an agentdeck-managed session
+	script := `S=$(tmux display-message -p '#{session_name}'); case "$S" in agentdeck_*) tmux detach-client ;; esac`
+	return exec.Command("tmux", "bind", "-n", "MouseDown1StatusRight", "run-shell", script).Run()
+}
+
+// UnbindMouseStatusClicks removes mouse click bindings from the status bar.
+func UnbindMouseStatusClicks() {
+	_ = exec.Command("tmux", "unbind", "-n", "MouseDown1StatusRight").Run()
 }
 
 // GetActiveSession returns the session name the user is currently attached to.

@@ -63,8 +63,13 @@ func DefaultRawPatterns(toolName string) *RawPatterns {
 				"building tool call...",
 				"waiting for tool response...",
 			},
-			PromptPatterns: []string{"Ask anything", "press enter to send"},
-			SpinnerChars:   []string{"█", "▓", "▒", "░"},
+			PromptPatterns: []string{
+				"Ask anything",
+				"press enter to send",
+				"enter submit", // question tool / permission approval help bar (#255)
+				"esc dismiss",  // question tool cancel affordance (#255)
+			},
+			SpinnerChars: []string{"█", "▓", "▒", "░"},
 		}
 	case "codex":
 		return &RawPatterns{
@@ -73,11 +78,24 @@ func DefaultRawPatterns(toolName string) *RawPatterns {
 				"esc to interrupt",
 				"press esc to interrupt",
 			},
-			PromptPatterns: []string{"How can I help", "codex>", "Continue?"},
+			PromptPatterns: []string{"How can I help", "codex>", "Continue?", `re:(?m)^\s*›\s`},
+		}
+	case "pi":
+		return &RawPatterns{
+			BusyPatterns: []string{
+				"ctrl+c to interrupt",
+				"esc to interrupt",
+			},
+			PromptPatterns: []string{`re:(?m)^\s*pi>\s*`},
 		}
 	case "shell":
 		return &RawPatterns{
 			PromptPatterns: []string{"$ ", "# ", "% "},
+		}
+	case "openclaw":
+		return &RawPatterns{
+			BusyPatterns:   []string{"[PROCESSING]", "[CONNECTING]", "[RECONNECTING]"},
+			PromptPatterns: []string{"openclaw> "},
 		}
 	default:
 		return nil

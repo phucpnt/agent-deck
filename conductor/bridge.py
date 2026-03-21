@@ -34,8 +34,6 @@ from aiogram.filters import Command, CommandStart
 AGENT_DECK_DIR = Path.home() / ".agent-deck"
 CONFIG_PATH = AGENT_DECK_DIR / "config.toml"
 CONDUCTOR_DIR = AGENT_DECK_DIR / "conductor"
-LOG_PATH = CONDUCTOR_DIR / "bridge.log"
-
 # Telegram message length limit
 TG_MAX_LENGTH = 4096
 
@@ -50,7 +48,6 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        logging.FileHandler(LOG_PATH, encoding="utf-8"),
         logging.StreamHandler(sys.stdout),
     ],
 )
@@ -293,6 +290,102 @@ def ensure_all_conductors_running(profiles: list[str]) -> dict[str, bool]:
 
 
 # ---------------------------------------------------------------------------
+# Hook system
+# ---------------------------------------------------------------------------
+
+DEFAULT_HOOK_TIMEOUT = 30  # seconds
+
+
+def resolve_hook(profile: str, hook_name: str) -> Path | None:
+    """Find a hook script by name, checking profile-level then global.
+
+    Returns the path to the executable hook, or None if not found.
+    Profile-level hooks take precedence over global hooks.
+    """
+    candidates = [
+        CONDUCTOR_DIR / profile / "hooks" / hook_name,
+        CONDUCTOR_DIR / "hooks" / hook_name,
+    ]
+    for path in candidates:
+        if path.exists():
+            if os.access(path, os.X_OK):
+                return path
+            log.warning(
+                "Hook '%s' found at %s but not executable, skipping",
+                hook_name, path,
+            )
+            return None
+    return None
+
+
+def run_hook(
+    hook_path: Path, stdin_data: dict, timeout: int = DEFAULT_HOOK_TIMEOUT
+) -> tuple[int, str, str]:
+    """Execute a hook script and return (exit_code, stdout, stderr).
+
+    Context is passed as JSON on stdin. Returns (exit_code, stdout, stderr).
+    On timeout, returns (1, "", "timeout").
+    """
+    payload = json.dumps(stdin_data)
+    try:
+        result = subprocess.run(
+            [str(hook_path)],
+            input=payload,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env={
+                **os.environ,
+                "CONDUCTOR_PROFILE": stdin_data.get("profile", ""),
+                "CONDUCTOR_DIR": str(CONDUCTOR_DIR),
+            },
+        )
+        return result.returncode, result.stdout, result.stderr
+    except subprocess.TimeoutExpired:
+        log.error("Hook '%s' timed out after %ds", hook_path.name, timeout)
+        return 1, "", "timeout"
+    except Exception as e:
+        log.error("Hook '%s' crashed: %s", hook_path.name, e)
+        return 1, "", str(e)
+
+
+def invoke_hook(
+    profile: str, hook_name: str, context: dict
+) -> tuple[bool, str] | None:
+    """Resolve and run a hook, returning (success, stdout) or None if no hook.
+
+    Reads timeout from meta.json hooks.timeout if available.
+    Logs all invocations, stdout, stderr, and exit codes.
+    """
+    hook_path = resolve_hook(profile, hook_name)
+    if hook_path is None:
+        return None
+
+    # Read timeout from meta.json if available
+    timeout = DEFAULT_HOOK_TIMEOUT
+    meta_path = CONDUCTOR_DIR / profile / "meta.json"
+    if meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text())
+            timeout = meta.get("hooks", {}).get("timeout", DEFAULT_HOOK_TIMEOUT)
+        except Exception:
+            pass
+
+    log.info("Hook [%s/%s]: invoking %s", profile, hook_name, hook_path)
+    exit_code, stdout, stderr = run_hook(hook_path, context, timeout)
+
+    if stderr.strip():
+        log.warning("Hook [%s/%s] stderr: %s", profile, hook_name, stderr.strip())
+
+    log.info(
+        "Hook [%s/%s]: exit_code=%d, stdout_len=%d",
+        profile, hook_name, exit_code, len(stdout),
+    )
+
+    return (exit_code == 0, stdout.strip())
+
+
+# ---------------------------------------------------------------------------
 # Message routing
 # ---------------------------------------------------------------------------
 
@@ -411,6 +504,36 @@ def split_message(text: str, max_len: int = TG_MAX_LENGTH) -> list[str]:
         chunks.append(text[:split_at])
         text = text[split_at:].lstrip("\n")
     return chunks
+
+
+def md_to_tg_html(text: str) -> str:
+    """Convert markdown bold/italic/code to Telegram HTML and escape unsafe chars.
+
+    Processes code spans first to protect their content from bold/italic conversion.
+    """
+    import html as _html
+
+    # 1. Extract code spans before escaping (protect their content)
+    code_spans: list[str] = []
+
+    def _save_code(m: re.Match) -> str:
+        code_spans.append(m.group(1))
+        return f"\x00CODE{len(code_spans) - 1}\x00"
+
+    text = re.sub(r'`(.+?)`', _save_code, text)
+
+    # 2. Escape HTML special chars
+    text = _html.escape(text, quote=False)
+
+    # 3. Convert bold/italic (code spans are already replaced with placeholders)
+    text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
+    text = re.sub(r'(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)', r'<i>\1</i>', text)
+
+    # 4. Restore code spans (escaped content wrapped in <code>)
+    for i, code in enumerate(code_spans):
+        text = text.replace(f"\x00CODE{i}\x00", f"<code>{_html.escape(code, quote=False)}</code>")
+
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -610,6 +733,20 @@ def create_bot(config: dict) -> tuple[Bot, Dispatcher]:
 
         session_title = conductor_session_title(target_profile)
 
+        # Run pre-message hook (can transform or gate the message)
+        hook_result = invoke_hook(target_profile, "pre-message", {
+            "profile": target_profile,
+            "message_text": cleaned_msg,
+            "user_id": message.from_user.id,
+        })
+        if hook_result is not None:
+            success, stdout = hook_result
+            if not success:
+                log.info("Message dropped by pre-message hook for [%s]", target_profile)
+                return
+            if stdout:
+                cleaned_msg = stdout
+
         # Ensure conductor is running for this profile
         if not ensure_conductor_running(target_profile):
             await message.answer(
@@ -668,24 +805,19 @@ def create_bot(config: dict) -> tuple[Bot, Dispatcher]:
 
         log.info("Conductor [%s] response: %s", target_profile, response[:100])
 
-        # Convert Markdown to Telegram HTML and send
-        html_response = md_to_telegram_mdv2(response)
-        chunks = split_message(html_response)
-        if chunks:
-            first = f"{profile_tag}{chunks[0]}" if profile_tag else chunks[0]
-            try:
-                await status_msg.edit_text(first, parse_mode="MarkdownV2")
-            except Exception:
-                try:
-                    await status_msg.edit_text(first)
-                except Exception:
-                    await message.answer(first)
-            for chunk in chunks[1:]:
-                prefixed = f"{profile_tag}{chunk}" if profile_tag else chunk
-                try:
-                    await message.answer(prefixed, parse_mode="MarkdownV2")
-                except Exception:
-                    await message.answer(prefixed)
+        # Convert to HTML first, then split to respect post-conversion length
+        html_response = md_to_tg_html(
+            f"{profile_tag}{response}" if profile_tag else response
+        )
+        for chunk in split_message(html_response):
+            await message.answer(chunk, parse_mode="HTML")
+
+        # Run post-message hook (non-gating)
+        invoke_hook(target_profile, "post-message", {
+            "profile": target_profile,
+            "message_text": cleaned_msg,
+            "response": response,
+        })
 
     return bot, dp
 
@@ -695,11 +827,36 @@ def create_bot(config: dict) -> tuple[Bot, Dispatcher]:
 # ---------------------------------------------------------------------------
 
 
+def _os_heartbeat_daemon_installed() -> bool:
+    """Check if an OS-level heartbeat daemon (launchd or systemd) is installed."""
+    import platform
+    home = os.path.expanduser("~")
+    if platform.system() == "Darwin":
+        # Check for any launchd plist matching the heartbeat pattern
+        agents_dir = os.path.join(home, "Library", "LaunchAgents")
+        if os.path.isdir(agents_dir):
+            for f in os.listdir(agents_dir):
+                if f.startswith("com.agentdeck.conductor-heartbeat.") and f.endswith(".plist"):
+                    return True
+    else:
+        # Check for any systemd timer matching the heartbeat pattern
+        timers_dir = os.path.join(home, ".config", "systemd", "user")
+        if os.path.isdir(timers_dir):
+            for f in os.listdir(timers_dir):
+                if f.startswith("agent-deck-conductor-heartbeat-") and f.endswith(".timer"):
+                    return True
+    return False
+
+
 async def heartbeat_loop(bot: Bot, config: dict):
     """Periodic heartbeat: check status across all profiles and trigger conductors."""
     interval_minutes = config["heartbeat_interval"]
     if interval_minutes <= 0:
         log.info("Heartbeat disabled (interval=0)")
+        return
+
+    if _os_heartbeat_daemon_installed():
+        log.info("OS heartbeat daemon detected, bridge heartbeat loop disabled (avoiding double-trigger)")
         return
 
     interval_seconds = interval_minutes * 60
@@ -788,6 +945,28 @@ async def heartbeat_loop(bot: Bot, config: dict):
 
                 heartbeat_msg = " ".join(parts)
 
+                # Run pre-heartbeat hook (can transform or gate the message)
+                sessions_for_hook = [
+                    {"title": s.get("title", ""), "status": s.get("status", ""), "path": s.get("path", "")}
+                    for s in sessions if s.get("title") != session_title
+                ]
+                hook_result = invoke_hook(profile, "pre-heartbeat", {
+                    "profile": profile,
+                    "waiting": waiting,
+                    "running": running,
+                    "idle": idle,
+                    "error": error,
+                    "sessions": sessions_for_hook,
+                    "draft_message": heartbeat_msg,
+                })
+                if hook_result is not None:
+                    success, stdout = hook_result
+                    if not success:
+                        log.info("Heartbeat [%s]: gated by pre-heartbeat hook", profile)
+                        continue
+                    if stdout:
+                        heartbeat_msg = stdout
+
                 # Ensure conductor is running for this profile
                 if not ensure_conductor_running(profile):
                     log.error(
@@ -818,19 +997,32 @@ async def heartbeat_loop(bot: Bot, config: dict):
                 )
 
                 # If conductor flagged items needing attention, notify via Telegram
-                if "NEED:" in response:
+                has_alerts = "NEED:" in response
+                if has_alerts:
                     try:
                         prefix = (
                             f"[{profile}] " if len(profiles) > 1 else ""
                         )
-                        await bot.send_message(
-                            authorized_user,
-                            f"{prefix}Conductor alert:\n{response}",
+                        alert_html = md_to_tg_html(
+                            f"{prefix}Conductor alert:\n{response}"
                         )
+                        for chunk in split_message(alert_html):
+                            await bot.send_message(
+                                authorized_user,
+                                chunk,
+                                parse_mode="HTML",
+                            )
                     except Exception as e:
                         log.error(
                             "Failed to send Telegram notification: %s", e
                         )
+
+                # Run post-heartbeat hook (non-gating)
+                invoke_hook(profile, "post-heartbeat", {
+                    "profile": profile,
+                    "response": response,
+                    "has_alerts": has_alerts,
+                })
 
             except Exception as e:
                 log.error("Heartbeat [%s] error: %s", profile, e)

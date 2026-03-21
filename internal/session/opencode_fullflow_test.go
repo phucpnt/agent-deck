@@ -11,6 +11,9 @@ import (
 // skipIfNoOpenCodeFullflow skips the test if OpenCode CLI is not available
 func skipIfNoOpenCodeFullflow(t *testing.T) {
 	t.Helper()
+	if os.Getenv("AGENT_DECK_E2E") == "" {
+		t.Skip("Skipping OpenCode E2E test (set AGENT_DECK_E2E=1 to run)")
+	}
 	if os.Getenv("CI") != "" {
 		t.Skip("Skipping OpenCode E2E test in CI environment")
 	}
@@ -19,10 +22,19 @@ func skipIfNoOpenCodeFullflow(t *testing.T) {
 	}
 }
 
+func skipIfNoOpenCodeSessionForFullflow(t *testing.T, projectPath string) {
+	t.Helper()
+	probe := &Instance{Tool: "opencode", ProjectPath: projectPath}
+	if probe.queryOpenCodeSession() == "" {
+		t.Skip("Skipping: no OpenCode sessions available for this project path")
+	}
+}
+
 // TestOpenCodeFullFlowSimulation simulates what happens when agent-deck loads
 // sessions and triggers detection
 func TestOpenCodeFullFlowSimulation(t *testing.T) {
 	skipIfNoOpenCodeFullflow(t)
+	skipIfNoOpenCodeSessionForFullflow(t, "/Users/ashesh/claude-deck")
 	t.Log("=== Full Flow Simulation ===")
 
 	// Step 1: Simulate loading from storage (like loadSessionsMsg)
@@ -103,6 +115,7 @@ func TestOpenCodeFullFlowSimulation(t *testing.T) {
 // This is the exact scenario that was causing the "Detecting session..." bug.
 func TestOpenCodePointerReplacementScenario(t *testing.T) {
 	skipIfNoOpenCodeFullflow(t)
+	skipIfNoOpenCodeSessionForFullflow(t, "/Users/ashesh/claude-deck")
 	t.Log("=== Pointer Replacement Scenario (Bug Reproduction) ===")
 
 	instanceID := "test-opencode-002"

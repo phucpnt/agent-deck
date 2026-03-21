@@ -289,7 +289,7 @@ func TestGetHeartbeatInterval(t *testing.T) {
 		interval int
 		expected int
 	}{
-		{0, 15},  // default
+		{0, 0},   // zero means disabled
 		{-1, 15}, // negative defaults to 15
 		{10, 10}, // custom
 		{30, 30}, // custom
@@ -450,6 +450,36 @@ func TestSlackSettings_TOML(t *testing.T) {
 	}
 }
 
+func TestDiscordSettings_TOML(t *testing.T) {
+	discord := DiscordSettings{
+		BotToken:              "discord-bot-token",
+		GuildID:               12345,
+		ChannelID:             67890,
+		UserID:                24680,
+		ListenMode:            "mentions",
+		IgnoreRepliesToOthers: true,
+	}
+
+	if discord.BotToken != "discord-bot-token" {
+		t.Errorf("bot_token mismatch: got %q", discord.BotToken)
+	}
+	if discord.GuildID != 12345 {
+		t.Errorf("guild_id mismatch: got %d", discord.GuildID)
+	}
+	if discord.ChannelID != 67890 {
+		t.Errorf("channel_id mismatch: got %d", discord.ChannelID)
+	}
+	if discord.UserID != 24680 {
+		t.Errorf("user_id mismatch: got %d", discord.UserID)
+	}
+	if discord.ListenMode != "mentions" {
+		t.Errorf("listen_mode mismatch: got %q", discord.ListenMode)
+	}
+	if !discord.IgnoreRepliesToOthers {
+		t.Error("ignore_replies_to_others should be true")
+	}
+}
+
 // --- Python bridge template tests ---
 
 func TestBridgeTemplate_ContainsSlackAuthorization(t *testing.T) {
@@ -533,13 +563,15 @@ func TestBridgeTemplate_ConfigLoadsAllowedUserIDs(t *testing.T) {
 	}
 }
 
-func TestBridgeTemplate_HeartbeatSelectsOnePerProfile(t *testing.T) {
+func TestBridgeTemplate_HeartbeatScopesToConductorGroups(t *testing.T) {
 	template := conductorBridgePy
 
 	patterns := []string{
 		"def select_heartbeat_conductors(conductors: list[dict]) -> list[dict]:",
 		"conductors = select_heartbeat_conductors(all_conductors)",
-		"Multiple conductors may share a profile. Heartbeat auto-actions are profile-wide,",
+		`s_group = s.get("group", "") or ""`,
+		`if s_group != name and not s_group.startswith(f"{name}/"):`,
+		`for s in scoped_sessions:`,
 	}
 
 	for _, pattern := range patterns {
@@ -715,6 +747,46 @@ func TestInstallSharedClaudeMD_CustomSymlinkCreatesConductorDir(t *testing.T) {
 	}
 }
 
+func TestInstallSharedConductorInstructions_CodexDefault(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	if err := InstallSharedConductorInstructions(ConductorAgentCodex, ""); err != nil {
+		t.Fatalf("InstallSharedConductorInstructions returned error: %v", err)
+	}
+
+	target := filepath.Join(tmpHome, ".agent-deck", "conductor", "AGENTS.md")
+	content, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("failed to read AGENTS.md: %v", err)
+	}
+	if !strings.Contains(string(content), "Codex") {
+		t.Fatal("AGENTS.md should mention Codex")
+	}
+	if !strings.Contains(string(content), "agent-deck -p <PROFILE> add <path> -t \"Title\" -c codex") {
+		t.Fatal("AGENTS.md should render codex session examples")
+	}
+}
+
+func TestInstallSharedConductorInstructions_AgentsCoexist(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	if err := InstallSharedConductorInstructions(ConductorAgentClaude, ""); err != nil {
+		t.Fatalf("InstallSharedConductorInstructions(claude) returned error: %v", err)
+	}
+	if err := InstallSharedConductorInstructions(ConductorAgentCodex, ""); err != nil {
+		t.Fatalf("InstallSharedConductorInstructions(codex) returned error: %v", err)
+	}
+
+	base := filepath.Join(tmpHome, ".agent-deck", "conductor")
+	for _, file := range []string{"CLAUDE.md", "AGENTS.md"} {
+		if _, err := os.Stat(filepath.Join(base, file)); err != nil {
+			t.Fatalf("%s should exist: %v", file, err)
+		}
+	}
+}
+
 func TestSetupConductor_DefaultTemplate(t *testing.T) {
 	name := "test-default"
 	profile := "default"
@@ -724,7 +796,7 @@ func TestSetupConductor_DefaultTemplate(t *testing.T) {
 	defer os.RemoveAll(filepath.Join(homeDir, ".agent-deck", "conductor", name))
 
 	// Setup without custom path (uses default template)
-	err := SetupConductor(name, profile, true, true, "test description", "", "")
+	err := SetupConductor(name, profile, true, true, "test description", "", "", nil, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -761,6 +833,64 @@ func TestSetupConductor_DefaultTemplate(t *testing.T) {
 	if meta.Name != name {
 		t.Errorf("expected name %q, got %q", name, meta.Name)
 	}
+	if meta.Agent != ConductorAgentClaude {
+		t.Errorf("expected agent %q, got %q", ConductorAgentClaude, meta.Agent)
+	}
+}
+
+func TestSetupConductorWithAgent_Codex(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	name := "test-codex"
+	if err := SetupConductorWithAgent(name, "default", ConductorAgentCodex, true, true, "codex conductor", "", "", nil, ""); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	dir, _ := ConductorNameDir(name)
+	agentsPath := filepath.Join(dir, "AGENTS.md")
+	content, err := os.ReadFile(agentsPath)
+	if err != nil {
+		t.Fatalf("failed to read AGENTS.md: %v", err)
+	}
+	if !strings.Contains(string(content), "Codex") {
+		t.Fatal("AGENTS.md should mention Codex")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "CLAUDE.md")); !os.IsNotExist(err) {
+		t.Fatal("CLAUDE.md should not be created for Codex conductor")
+	}
+
+	meta, err := LoadConductorMeta(name)
+	if err != nil {
+		t.Fatalf("failed to load meta: %v", err)
+	}
+	if meta.Agent != ConductorAgentCodex {
+		t.Fatalf("agent = %q, want %q", meta.Agent, ConductorAgentCodex)
+	}
+	if meta.GetClearOnCompact() {
+		t.Fatal("codex conductor should not enable clear_on_compact")
+	}
+}
+
+func TestSetupConductorWithAgent_RemovesStaleInstructionsFile(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	name := "switch-agent"
+	if err := SetupConductor(name, "default", true, true, "", "", "", nil, ""); err != nil {
+		t.Fatalf("failed to create initial Claude conductor: %v", err)
+	}
+	if err := SetupConductorWithAgent(name, "default", ConductorAgentCodex, true, true, "", "", "", nil, ""); err != nil {
+		t.Fatalf("failed to switch conductor to Codex: %v", err)
+	}
+
+	dir, _ := ConductorNameDir(name)
+	if _, err := os.Stat(filepath.Join(dir, "CLAUDE.md")); !os.IsNotExist(err) {
+		t.Fatal("CLAUDE.md should be removed after switching conductor agent to Codex")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "AGENTS.md")); err != nil {
+		t.Fatalf("AGENTS.md should exist after switching conductor agent to Codex: %v", err)
+	}
 }
 
 func TestSetupConductor_CustomSymlink(t *testing.T) {
@@ -780,7 +910,7 @@ func TestSetupConductor_CustomSymlink(t *testing.T) {
 	defer os.RemoveAll(filepath.Join(homeDir, ".agent-deck", "conductor", name))
 
 	// Setup with custom path (creates symlink)
-	err := SetupConductor(name, profile, true, true, "test description", customPath, "")
+	err := SetupConductor(name, profile, true, true, "test description", customPath, "", nil, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -810,7 +940,7 @@ func TestSetupConductor_EmptyProfileNormalizesToDefault(t *testing.T) {
 	t.Setenv("HOME", tmpHome)
 
 	name := "default-profile-conductor"
-	if err := SetupConductor(name, "", true, true, "", "", ""); err != nil {
+	if err := SetupConductor(name, "", true, true, "", "", "", nil, ""); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -837,11 +967,11 @@ func TestSetupConductor_ProfileConflict(t *testing.T) {
 	t.Setenv("HOME", tmpHome)
 
 	name := "profile-conflict"
-	if err := SetupConductor(name, "work", true, true, "", "", ""); err != nil {
+	if err := SetupConductor(name, "work", true, true, "", "", "", nil, ""); err != nil {
 		t.Fatalf("first setup failed: %v", err)
 	}
 
-	err := SetupConductor(name, "personal", true, true, "", "", "")
+	err := SetupConductor(name, "personal", true, true, "", "", "", nil, "")
 	if err == nil {
 		t.Fatal("expected conflict error when reusing conductor name across profiles")
 	}
@@ -871,6 +1001,30 @@ func TestLoadConductorMeta_EmptyProfileDefaultsToDefault(t *testing.T) {
 	}
 	if meta.Profile != DefaultProfile {
 		t.Fatalf("meta profile = %q, want %q", meta.Profile, DefaultProfile)
+	}
+}
+
+func TestLoadConductorMeta_EmptyAgentDefaultsToClaude(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	name := "meta-empty-agent"
+	dir, _ := ConductorNameDir(name)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("failed to create conductor dir: %v", err)
+	}
+
+	raw := `{"name":"meta-empty-agent","profile":"default","heartbeat_enabled":true,"created_at":"2026-01-01T00:00:00Z"}`
+	if err := os.WriteFile(filepath.Join(dir, "meta.json"), []byte(raw), 0o644); err != nil {
+		t.Fatalf("failed to write meta.json: %v", err)
+	}
+
+	meta, err := LoadConductorMeta(name)
+	if err != nil {
+		t.Fatalf("LoadConductorMeta failed: %v", err)
+	}
+	if meta.Agent != ConductorAgentClaude {
+		t.Fatalf("meta agent = %q, want %q", meta.Agent, ConductorAgentClaude)
 	}
 }
 
@@ -967,6 +1121,9 @@ func TestGenerateSystemdHeartbeatService_IncludesAgentDeckDir(t *testing.T) {
 func TestGenerateHeartbeatPlist_IncludesAgentDeckDir(t *testing.T) {
 	plist, err := GenerateHeartbeatPlist("test-conductor", 15)
 	if err != nil {
+		if strings.Contains(err.Error(), "not found in PATH") {
+			t.Skipf("skipping: %v", err)
+		}
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if strings.Contains(plist, "__PATH__") {
@@ -985,6 +1142,9 @@ func TestGenerateHeartbeatPlist_IncludesAgentDeckDir(t *testing.T) {
 func TestGenerateLaunchdPlist_IncludesAgentDeckDir(t *testing.T) {
 	plist, err := GenerateLaunchdPlist()
 	if err != nil {
+		if strings.Contains(err.Error(), "not found in PATH") {
+			t.Skipf("skipping: %v", err)
+		}
 		t.Fatalf("unexpected error: %v", err)
 	}
 	// Verify no __PATH__ placeholder remains
@@ -1206,7 +1366,7 @@ func TestSetupConductor_PolicyOverride(t *testing.T) {
 	defer os.RemoveAll(filepath.Join(homeDir, ".agent-deck", "conductor", name))
 
 	// Setup with custom policy path (creates per-conductor symlink)
-	err := SetupConductor(name, profile, true, true, "test description", "", customPolicyPath)
+	err := SetupConductor(name, profile, true, true, "test description", "", customPolicyPath, nil, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1385,7 +1545,7 @@ func TestSetupConductorCreatesLearnings(t *testing.T) {
 	t.Setenv("HOME", tmpHome)
 
 	name := "learnings-test"
-	if err := SetupConductor(name, "default", true, true, "", "", ""); err != nil {
+	if err := SetupConductor(name, "default", true, true, "", "", "", nil, ""); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -1410,7 +1570,7 @@ func TestSetupConductorPreservesExistingLearnings(t *testing.T) {
 
 	name := "learnings-preserve"
 	// First setup creates the file
-	if err := SetupConductor(name, "default", true, true, "", "", ""); err != nil {
+	if err := SetupConductor(name, "default", true, true, "", "", "", nil, ""); err != nil {
 		t.Fatalf("first setup failed: %v", err)
 	}
 
@@ -1423,7 +1583,7 @@ func TestSetupConductorPreservesExistingLearnings(t *testing.T) {
 	}
 
 	// Re-running setup should NOT overwrite
-	if err := SetupConductor(name, "default", true, true, "", "", ""); err != nil {
+	if err := SetupConductor(name, "default", true, true, "", "", "", nil, ""); err != nil {
 		t.Fatalf("second setup failed: %v", err)
 	}
 
@@ -1722,6 +1882,179 @@ func TestConductorMeta_GetClearOnCompact(t *testing.T) {
 	}
 }
 
+// --- Discord bridge template tests ---
+
+func TestBridgeTemplate_ContainsDiscordBot(t *testing.T) {
+	template := conductorBridgePy
+	patterns := []string{
+		"HAS_DISCORD",
+		"create_discord_bot",
+		"DISCORD_MAX_LENGTH",
+		"class ConductorBot(discord.Client):",
+	}
+	for _, pattern := range patterns {
+		if !strings.Contains(template, pattern) {
+			t.Errorf("template should contain Discord pattern: %q", pattern)
+		}
+	}
+}
+
+func TestBridgeTemplate_ContainsDiscordAuthorization(t *testing.T) {
+	template := conductorBridgePy
+
+	// Check for authorization function
+	if !strings.Contains(template, "def is_authorized(user_id: int) -> bool:") {
+		t.Error("template should contain is_authorized function for Discord")
+	}
+
+	// Check for unauthorized message logging
+	if !strings.Contains(template, "Unauthorized Discord message from user") {
+		t.Error("template should log unauthorized Discord messages")
+	}
+}
+
+func TestBridgeTemplate_DiscordConfigLoading(t *testing.T) {
+	template := conductorBridgePy
+	patterns := []string{
+		`dc = conductor_cfg.get("discord", {})`,
+		`dc_bot_token = dc.get("bot_token", "")`,
+		`dc_guild_id = dc.get("guild_id", 0)`,
+		`dc_channel_id = dc.get("channel_id", 0)`,
+		`dc_user_id = dc.get("user_id", 0)`,
+		`dc_listen_mode = dc.get("listen_mode", "all")`,
+		`dc_ignore_replies_to_others = dc.get("ignore_replies_to_others", False)`,
+		`"listen_mode": dc_listen_mode,`,
+		`"ignore_replies_to_others": bool(dc_ignore_replies_to_others),`,
+		`"discord":`,
+	}
+	for _, pattern := range patterns {
+		if !strings.Contains(template, pattern) {
+			t.Errorf("template should contain Discord config pattern: %q", pattern)
+		}
+	}
+}
+
+func TestBridgeTemplate_DiscordSlashCommands(t *testing.T) {
+	template := conductorBridgePy
+	commands := []string{
+		`name="ad-status"`,
+		`name="ad-sessions"`,
+		`name="ad-restart"`,
+		`name="ad-help"`,
+	}
+	for _, cmd := range commands {
+		if !strings.Contains(template, cmd) {
+			t.Errorf("template should contain Discord slash command: %q", cmd)
+		}
+	}
+}
+
+func TestBridgeTemplate_DiscordSlashCommandsChannelRestriction(t *testing.T) {
+	template := conductorBridgePy
+	patterns := []string{
+		"async def ensure_discord_channel(interaction: discord.Interaction) -> bool:",
+		`if interaction.channel_id != channel_id:`,
+		`"This command is only available in the configured channel."`,
+		"if not await ensure_discord_channel(interaction):",
+	}
+	for _, pattern := range patterns {
+		if !strings.Contains(template, pattern) {
+			t.Errorf("template should contain Discord channel restriction pattern: %q", pattern)
+		}
+	}
+}
+
+func TestBridgeTemplate_DiscordListenModeSupport(t *testing.T) {
+	template := conductorBridgePy
+	patterns := []string{
+		`listen_mode = str(config["discord"].get("listen_mode", "all") or "all").strip().lower()`,
+		`if listen_mode not in {"all", "mentions"}:`,
+		`if listen_mode == "mentions":`,
+		`if not message_mentions_bot(message):`,
+		`text = strip_bot_mentions(text)`,
+		`return re.sub(rf"<@!?{bot.user.id}>", "", text).strip()`,
+	}
+	for _, pattern := range patterns {
+		if !strings.Contains(template, pattern) {
+			t.Errorf("template should contain Discord listen_mode pattern: %q", pattern)
+		}
+	}
+}
+
+func TestBridgeTemplate_DiscordReplyFilterSupport(t *testing.T) {
+	template := conductorBridgePy
+	patterns := []string{
+		`ignore_replies_to_others = bool(`,
+		`config["discord"].get("ignore_replies_to_others", False)`,
+		`async def should_ignore_reply_to_other(message: discord.Message) -> bool:`,
+		`referenced = await message.channel.fetch_message(reference_id)`,
+		`if referenced.author.id != bot.user.id:`,
+		`if await should_ignore_reply_to_other(message):`,
+	}
+	for _, pattern := range patterns {
+		if !strings.Contains(template, pattern) {
+			t.Errorf("template should contain Discord reply filter pattern: %q", pattern)
+		}
+	}
+}
+
+func TestBridgeTemplate_DiscordHeartbeatNotification(t *testing.T) {
+	template := conductorBridgePy
+	if !strings.Contains(template, "discord_bot=None, discord_channel_id=None") {
+		t.Error("heartbeat_loop should accept discord_bot and discord_channel_id params")
+	}
+	if !strings.Contains(template, "Failed to send Discord notification") {
+		t.Error("heartbeat should handle Discord notification errors")
+	}
+	if !strings.Contains(template, "await send_discord_output(channel, alert_msg)") {
+		t.Error("heartbeat should route Discord notifications through send_discord_output")
+	}
+}
+
+func TestBridgeTemplate_DiscordInMain(t *testing.T) {
+	template := conductorBridgePy
+	patterns := []string{
+		`dc_ok = config["discord"]["configured"] and HAS_DISCORD`,
+		"create_discord_bot(config)",
+		`discord_bot.start(config["discord"]["bot_token"])`,
+		"discord_bot.close()",
+	}
+	for _, pattern := range patterns {
+		if !strings.Contains(template, pattern) {
+			t.Errorf("main() should contain Discord pattern: %q", pattern)
+		}
+	}
+}
+
+func TestBridgeTemplate_DiscordTypingIndicator(t *testing.T) {
+	template := conductorBridgePy
+	if !strings.Contains(template, "async with message.channel.typing():") {
+		t.Error("Discord on_message should show typing indicator while waiting for conductor response")
+	}
+	if !strings.Contains(template, "run_in_executor") {
+		t.Error("Discord on_message should offload blocking send_to_conductor to thread executor")
+	}
+}
+
+func TestBridgeTemplate_DiscordImageUploadSupport(t *testing.T) {
+	template := conductorBridgePy
+	patterns := []string{
+		`IMAGE_MARKER_RE = re.compile(r"\[IMAGE:(?P<path>[^\]]+)\]")`,
+		`def parse_discord_message_parts(text: str) -> list[tuple[str, str]]:`,
+		`async def send_discord_output(channel, text: str, name_tag: str = ""):`,
+		`await channel.send(`,
+		`file=discord.File(str(image_path)),`,
+		`[Image path must be absolute:`,
+		`[Image not found:`,
+		`await send_discord_output(message.channel, response, name_tag=name_tag)`,
+	}
+	for _, pattern := range patterns {
+		if !strings.Contains(template, pattern) {
+			t.Errorf("template should contain Discord image upload pattern: %q", pattern)
+		}
+	}
+}
+
 func TestConductorClearOnCompact(t *testing.T) {
 	// Override HOME so LoadConductorMeta reads from our temp dir
 	tmpHome := t.TempDir()
@@ -1756,9 +2089,192 @@ func TestConductorClearOnCompact(t *testing.T) {
 		t.Error("should return false when clear_on_compact is explicitly disabled")
 	}
 
+	meta = ConductorMeta{Name: "main", Agent: ConductorAgentCodex, Profile: "default"}
+	data, _ = json.Marshal(meta)
+	if err := os.WriteFile(filepath.Join(condDir, "meta.json"), data, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if inst.ConductorClearOnCompact() {
+		t.Error("codex conductors should always disable clear_on_compact")
+	}
+
 	// Non-conductor title should return false (not a conductor-prefixed session)
 	nonConductor := &Instance{Title: "my-session", GroupPath: "conductor"}
 	if nonConductor.ConductorClearOnCompact() {
 		t.Error("non-conductor-prefixed title should return false")
+	}
+}
+
+// TestConductorHeartbeatScript_GroupScoped verifies the heartbeat script references
+// the conductor's own group (not all sessions in the profile) and includes an
+// enabled-config guard.
+func TestConductorHeartbeatScript_GroupScoped(t *testing.T) {
+	// The heartbeat message must NOT reference "all sessions in the {PROFILE} profile"
+	if strings.Contains(conductorHeartbeatScript, "Check all sessions in the") {
+		t.Fatal("heartbeat script should NOT reference 'all sessions in the {PROFILE} profile'; must be group-scoped")
+	}
+
+	// The heartbeat message must reference the conductor's own group via {NAME}
+	if !strings.Contains(conductorHeartbeatScript, "{NAME}") {
+		t.Fatal("heartbeat script must reference {NAME} for group scoping")
+	}
+	if !strings.Contains(conductorHeartbeatScript, "Check sessions in") {
+		t.Fatal("heartbeat script should contain group-scoped message like 'Check sessions in'")
+	}
+
+	// The script must contain an enabled-config guard that queries conductor status
+	if !strings.Contains(conductorHeartbeatScript, "ENABLED") {
+		t.Fatal("heartbeat script must contain an ENABLED guard that checks conductor status before sending")
+	}
+	if !strings.Contains(conductorHeartbeatScript, "conductor status") {
+		t.Fatal("heartbeat script must query conductor status to determine if enabled")
+	}
+}
+
+// TestGetHeartbeatInterval_ZeroMeansDisabled verifies interval=0 means disabled,
+// negative means use default, and positive means use the configured value.
+func TestGetHeartbeatInterval_ZeroMeansDisabled(t *testing.T) {
+	tests := []struct {
+		name     string
+		interval int
+		expected int
+	}{
+		{"zero means disabled", 0, 0},
+		{"negative means default", -1, 15},
+		{"custom value", 30, 30},
+		{"explicit default", 15, 15},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			settings := ConductorSettings{HeartbeatInterval: tt.interval}
+			got := settings.GetHeartbeatInterval()
+			if got != tt.expected {
+				t.Errorf("GetHeartbeatInterval() with %d = %d, want %d", tt.interval, got, tt.expected)
+			}
+		})
+	}
+}
+
+// --- Slack markdown-to-mrkdwn converter tests ---
+
+func TestBridgeTemplate_ContainsMarkdownToSlackConverter(t *testing.T) {
+	template := conductorBridgePy
+
+	// Function definition must exist.
+	if !strings.Contains(template, "def _markdown_to_slack(text: str) -> str:") {
+		t.Error("template should contain _markdown_to_slack function definition")
+	}
+
+	// Header conversion regex.
+	if !strings.Contains(template, `^#{1,6}\s+`) {
+		t.Error("template should contain GFM header regex ^#{1,6}\\s+")
+	}
+
+	// Bold conversion: **text** -> *text*.
+	if !strings.Contains(template, `\*\*(.+?)\*\*`) {
+		t.Error("template should contain bold regex \\*\\*(.+?)\\*\\*")
+	}
+
+	// Strikethrough conversion: ~~text~~ -> ~text~.
+	if !strings.Contains(template, `~~(.+?)~~`) {
+		t.Error("template should contain strikethrough regex ~~(.+?)~~")
+	}
+
+	// Link conversion: [text](url) -> <url|text>.
+	if !strings.Contains(template, `\[([^\]]+)\]\(([^)]+)\)`) {
+		t.Error("template should contain link regex \\[([^\\]]+)\\]\\(([^)]+)\\)")
+	}
+
+	// Bullet list conversion.
+	if !strings.Contains(template, `^(\s*)[-*]\s+`) {
+		t.Error("template should contain bullet list regex ^(\\s*)[-*]\\s+")
+	}
+
+	// Code block protection.
+	if !strings.Contains(template, "code_blocks = []") {
+		t.Error("template should contain code block protection list")
+	}
+
+	// Inline code protection.
+	if !strings.Contains(template, "inline_codes = []") {
+		t.Error("template should contain inline code protection list")
+	}
+}
+
+func TestBridgeTemplate_SafeSayConvertsMarkdown(t *testing.T) {
+	template := conductorBridgePy
+
+	// _safe_say must call _markdown_to_slack.
+	if !strings.Contains(template, "_markdown_to_slack(kwargs[\"text\"])") {
+		t.Error("_safe_say should apply _markdown_to_slack to kwargs[\"text\"]")
+	}
+
+	// The conversion must be conditional on "text" being in kwargs.
+	if !strings.Contains(template, `if "text" in kwargs:`) {
+		t.Error("_safe_say should guard _markdown_to_slack call with 'if \"text\" in kwargs:'")
+	}
+}
+
+func TestSetupConductor_WithEnvVars(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	name := "test-env-conductor"
+	env := map[string]string{
+		"ANTHROPIC_BASE_URL":   "https://api.z.ai/api/anthropic",
+		"ANTHROPIC_AUTH_TOKEN": "test-token",
+	}
+	err := SetupConductor(name, "default", true, true, "env test", "", "", env, "~/.conductor.env")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	meta, err := LoadConductorMeta(name)
+	if err != nil {
+		t.Fatalf("failed to load meta: %v", err)
+	}
+
+	if len(meta.Env) != 2 {
+		t.Errorf("expected 2 env vars, got %d", len(meta.Env))
+	}
+	if meta.Env["ANTHROPIC_BASE_URL"] != "https://api.z.ai/api/anthropic" {
+		t.Errorf("unexpected ANTHROPIC_BASE_URL: %s", meta.Env["ANTHROPIC_BASE_URL"])
+	}
+	if meta.EnvFile != "~/.conductor.env" {
+		t.Errorf("unexpected env_file: %s", meta.EnvFile)
+	}
+
+	// Verify restricted file permissions when env vars present
+	dir, _ := ConductorNameDir(name)
+	info, err := os.Stat(filepath.Join(dir, "meta.json"))
+	if err != nil {
+		t.Fatalf("failed to stat meta.json: %v", err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Errorf("expected 0600 permissions for meta.json with env vars, got %o", info.Mode().Perm())
+	}
+}
+
+func TestSetupConductor_WithoutEnvVars(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	name := "test-no-env-conductor"
+	err := SetupConductor(name, "default", true, true, "", "", "", nil, "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	meta, err := LoadConductorMeta(name)
+	if err != nil {
+		t.Fatalf("failed to load meta: %v", err)
+	}
+
+	if meta.Env != nil {
+		t.Errorf("expected nil env, got %v", meta.Env)
+	}
+	if meta.EnvFile != "" {
+		t.Errorf("expected empty env_file, got %s", meta.EnvFile)
 	}
 }

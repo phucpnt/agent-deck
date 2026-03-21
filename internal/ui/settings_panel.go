@@ -1,6 +1,8 @@
 package ui
 
 import (
+	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -18,7 +20,9 @@ const (
 	SettingDefaultTool
 	SettingDangerousMode
 	SettingClaudeConfigDir
+	SettingClaudeUseHappy
 	SettingGeminiYoloMode
+	SettingCodexUseHappy
 	SettingCodexYoloMode
 	SettingCheckForUpdates
 	SettingAutoUpdate
@@ -34,7 +38,7 @@ const (
 )
 
 // Total number of navigable settings.
-const settingsCount = 17
+const settingsCount = 19
 
 // SettingsPanel displays and edits user configuration
 type SettingsPanel struct {
@@ -45,13 +49,19 @@ type SettingsPanel struct {
 	scrollOffset int // Scroll offset when content overflows terminal height
 	profile      string
 
+	// Dynamic tool lists (built-in + custom tools from config)
+	toolNames  []string
+	toolValues []string
+
 	// Setting values
 	selectedTheme       int // 0=dark, 1=light, 2=system
-	selectedTool        int // 0=claude, 1=gemini, 2=opencode, 3=codex, 4=none
+	selectedTool        int // index into toolNames/toolValues
 	dangerousMode       bool
 	claudeConfigDir     string
 	claudeConfigIsScope bool // true = profile override, false = global [claude]
+	claudeUseHappy      bool
 	geminiYoloMode      bool
+	codexUseHappy       bool
 	codexYoloMode       bool
 	checkForUpdates     bool
 	autoUpdate          bool
@@ -76,10 +86,11 @@ type SettingsPanel struct {
 	originalConfig *session.UserConfig
 }
 
-// Tool names for radio selection
+// builtinToolNames and builtinToolValues are the built-in tools. Custom tools
+// from config are appended dynamically in LoadConfig.
 var (
-	toolNames  = []string{"Claude", "Gemini", "OpenCode", "Codex", "None"}
-	toolValues = []string{"claude", "gemini", "opencode", "codex", ""}
+	builtinToolNames  = []string{"Claude", "Gemini", "OpenCode", "Codex", "Pi"}
+	builtinToolValues = []string{"claude", "gemini", "opencode", "codex", "pi"}
 )
 
 // Search tier names for radio selection
@@ -97,6 +108,8 @@ var (
 // NewSettingsPanel creates a new settings panel
 func NewSettingsPanel() *SettingsPanel {
 	return &SettingsPanel{
+		toolNames:           append(append([]string{}, builtinToolNames...), "None"),
+		toolValues:          append(append([]string{}, builtinToolValues...), ""),
 		logMaxSizeMB:        10,
 		logMaxLines:         10000,
 		removeOrphans:       true,
@@ -140,6 +153,20 @@ func (s *SettingsPanel) NeedsRestart() bool {
 	return s.needsRestart
 }
 
+// ScrollUp moves the settings cursor up by one (mouse wheel support).
+func (s *SettingsPanel) ScrollUp() {
+	if s.visible && s.cursor > 0 {
+		s.cursor--
+	}
+}
+
+// ScrollDown moves the settings cursor down by one (mouse wheel support).
+func (s *SettingsPanel) ScrollDown() {
+	if s.visible && s.cursor < settingsCount-1 {
+		s.cursor++
+	}
+}
+
 // SetSize sets the panel dimensions
 func (s *SettingsPanel) SetSize(width, height int) {
 	s.width = width
@@ -163,9 +190,12 @@ func (s *SettingsPanel) LoadConfig(config *session.UserConfig) {
 		s.selectedTheme = 0
 	}
 
+	// Rebuild tool lists: built-ins + custom tools + "None".
+	s.buildToolLists(config)
+
 	// Default tool
-	s.selectedTool = 4 // None by default
-	for i, val := range toolValues {
+	s.selectedTool = len(s.toolValues) - 1 // None by default
+	for i, val := range s.toolValues {
 		if val == config.DefaultTool {
 			s.selectedTool = i
 			break
@@ -176,6 +206,7 @@ func (s *SettingsPanel) LoadConfig(config *session.UserConfig) {
 	s.dangerousMode = config.Claude.GetDangerousMode()
 	s.claudeConfigDir = config.Claude.ConfigDir
 	s.claudeConfigIsScope = false
+	s.claudeUseHappy = config.Claude.UseHappy
 	if s.profile != "" && config.Profiles != nil {
 		if profileCfg, ok := config.Profiles[s.profile]; ok && profileCfg.Claude.ConfigDir != "" {
 			s.claudeConfigDir = profileCfg.Claude.ConfigDir
@@ -187,6 +218,7 @@ func (s *SettingsPanel) LoadConfig(config *session.UserConfig) {
 	s.geminiYoloMode = config.Gemini.YoloMode
 
 	// Codex settings
+	s.codexUseHappy = config.Codex.UseHappy
 	s.codexYoloMode = config.Codex.YoloMode
 
 	// Update settings
@@ -226,6 +258,36 @@ func (s *SettingsPanel) LoadConfig(config *session.UserConfig) {
 	s.maintenanceEnabled = config.Maintenance.Enabled
 }
 
+func (s *SettingsPanel) buildToolLists(config *session.UserConfig) {
+	names := append([]string{}, builtinToolNames...)
+	values := append([]string{}, builtinToolValues...)
+
+	if len(config.Tools) > 0 {
+		builtins := map[string]bool{
+			"claude": true, "gemini": true, "opencode": true,
+			"codex": true, "pi": true, "shell": true, "cursor": true, "aider": true,
+		}
+		var custom []string
+		for name := range config.Tools {
+			if !builtins[name] {
+				custom = append(custom, name)
+			}
+		}
+		sort.Strings(custom)
+		for _, name := range custom {
+			display := strings.ToUpper(name[:1]) + name[1:]
+			names = append(names, display)
+			values = append(values, name)
+		}
+	}
+
+	names = append(names, "None")
+	values = append(values, "")
+
+	s.toolNames = names
+	s.toolValues = values
+}
+
 // GetConfig returns a UserConfig with current panel values
 func (s *SettingsPanel) GetConfig() *session.UserConfig {
 	config := &session.UserConfig{
@@ -234,19 +296,31 @@ func (s *SettingsPanel) GetConfig() *session.UserConfig {
 		MCPs:        make(map[string]session.MCPDef),
 	}
 
+	if s.originalConfig != nil {
+		config.Claude = s.originalConfig.Claude
+		config.Gemini = s.originalConfig.Gemini
+		config.Codex = s.originalConfig.Codex
+		config.Updates = s.originalConfig.Updates
+		config.Logs = s.originalConfig.Logs
+		config.GlobalSearch = s.originalConfig.GlobalSearch
+		config.Preview = s.originalConfig.Preview
+		config.Maintenance = s.originalConfig.Maintenance
+	}
+
 	// Theme
 	if s.selectedTheme < len(themeValues) {
 		config.Theme = themeValues[s.selectedTheme]
 	}
 
 	// Default tool
-	if s.selectedTool >= 0 && s.selectedTool < len(toolValues) {
-		config.DefaultTool = toolValues[s.selectedTool]
+	if s.selectedTool >= 0 && s.selectedTool < len(s.toolValues) {
+		config.DefaultTool = s.toolValues[s.selectedTool]
 	}
 
 	// Claude settings
 	dangerousModeVal := s.dangerousMode
 	config.Claude.DangerousMode = &dangerousModeVal
+	config.Claude.UseHappy = s.claudeUseHappy
 	if !s.claudeConfigIsScope {
 		config.Claude.ConfigDir = s.claudeConfigDir
 	}
@@ -255,6 +329,7 @@ func (s *SettingsPanel) GetConfig() *session.UserConfig {
 	config.Gemini.YoloMode = s.geminiYoloMode
 
 	// Codex settings
+	config.Codex.UseHappy = s.codexUseHappy
 	config.Codex.YoloMode = s.codexYoloMode
 
 	// Update settings
@@ -288,6 +363,9 @@ func (s *SettingsPanel) GetConfig() *session.UserConfig {
 		config.Tools = s.originalConfig.Tools
 		config.MCPPool = s.originalConfig.MCPPool
 		config.Docker = s.originalConfig.Docker
+		config.Preview.ShowNotes = s.originalConfig.Preview.ShowNotes
+		config.Preview.NotesOutputSplit = s.originalConfig.Preview.NotesOutputSplit
+		config.Preview.Analytics = s.originalConfig.Preview.Analytics
 		config.Profiles = s.originalConfig.Profiles
 		// Keep global Claude config when editing profile-specific override.
 		if s.claudeConfigIsScope {
@@ -370,7 +448,7 @@ func (s *SettingsPanel) adjustValue(delta int) bool {
 
 	case SettingDefaultTool:
 		newVal := s.selectedTool + delta
-		if newVal >= 0 && newVal < len(toolNames) {
+		if newVal >= 0 && newVal < len(s.toolNames) {
 			s.selectedTool = newVal
 			changed = true
 		}
@@ -422,8 +500,16 @@ func (s *SettingsPanel) toggleValue() bool {
 		s.dangerousMode = !s.dangerousMode
 		return true
 
+	case SettingClaudeUseHappy:
+		s.claudeUseHappy = !s.claudeUseHappy
+		return true
+
 	case SettingGeminiYoloMode:
 		s.geminiYoloMode = !s.geminiYoloMode
+		return true
+
+	case SettingCodexUseHappy:
+		s.codexUseHappy = !s.codexUseHappy
 		return true
 
 	case SettingCodexYoloMode:
@@ -570,7 +656,7 @@ func (s *SettingsPanel) View() string {
 	// DEFAULT TOOL
 	content.WriteString(sectionStyle.Render("DEFAULT TOOL"))
 	content.WriteString("\n")
-	line := s.renderRadioGroup(toolNames, s.selectedTool, s.cursor == int(SettingDefaultTool))
+	line := s.renderRadioGroup(s.toolNames, s.selectedTool, s.cursor == int(SettingDefaultTool))
 	if s.cursor == int(SettingDefaultTool) {
 		line = highlightStyle.Render(line)
 	}
@@ -605,6 +691,12 @@ func (s *SettingsPanel) View() string {
 	if s.cursor == int(SettingClaudeConfigDir) {
 		line = highlightStyle.Render(line)
 	}
+	content.WriteString("  " + labelStyle.Render(line) + "\n")
+
+	line = s.renderCheckbox("Use happy wrapper", s.claudeUseHappy) + " - Launch Claude via happy"
+	if s.cursor == int(SettingClaudeUseHappy) {
+		line = highlightStyle.Render(line)
+	}
 	content.WriteString("  " + labelStyle.Render(line) + "\n\n")
 
 	// GEMINI
@@ -621,6 +713,12 @@ func (s *SettingsPanel) View() string {
 	// CODEX
 	content.WriteString(sectionStyle.Render("CODEX"))
 	content.WriteString("\n")
+
+	line = s.renderCheckbox("Use happy wrapper", s.codexUseHappy) + " - Launch Codex via happy"
+	if s.cursor == int(SettingCodexUseHappy) {
+		line = highlightStyle.Render(line)
+	}
+	content.WriteString("  " + labelStyle.Render(line) + "\n")
 
 	// YOLO mode checkbox
 	line = s.renderCheckbox("YOLO mode", s.codexYoloMode) + " - Bypass approvals and sandbox"
@@ -726,7 +824,13 @@ func (s *SettingsPanel) View() string {
 	content.WriteString("\n")
 	content.WriteString(dimStyle.Render("  Edit ~/.agent-deck/config.toml to configure MCPs and tools."))
 	content.WriteString("\n")
-	content.WriteString(dimStyle.Render("  Press m on any Claude/Gemini session to attach MCPs."))
+	hotkeys := resolveHotkeys(session.GetHotkeyOverrides())
+	mcpKey := actionHotkey(hotkeys, hotkeyMCPManager)
+	mcpHint := "  MCP Manager hotkey is unbound."
+	if mcpKey != "" {
+		mcpHint = fmt.Sprintf("  Press %s on any Claude/Gemini session to attach MCPs.", mcpKey)
+	}
+	content.WriteString(dimStyle.Render(mcpHint))
 	content.WriteString("\n\n")
 
 	// Help bar
@@ -752,19 +856,21 @@ func (s *SettingsPanel) View() string {
 			7,  // SettingDefaultTool
 			11, // SettingDangerousMode
 			12, // SettingClaudeConfigDir
-			15, // SettingGeminiYoloMode
-			18, // SettingCodexYoloMode
-			21, // SettingCheckForUpdates
-			22, // SettingAutoUpdate
-			25, // SettingLogMaxSize
-			25, // SettingLogMaxLines (shares line with LogMaxSize)
-			26, // SettingRemoveOrphans
-			29, // SettingGlobalSearchEnabled
-			30, // SettingSearchTier
-			31, // SettingRecentDays
-			34, // SettingShowOutput
-			35, // SettingShowAnalytics
-			38, // SettingMaintenanceEnabled
+			13, // SettingClaudeUseHappy
+			16, // SettingGeminiYoloMode
+			19, // SettingCodexUseHappy
+			20, // SettingCodexYoloMode
+			23, // SettingCheckForUpdates
+			24, // SettingAutoUpdate
+			27, // SettingLogMaxSize
+			27, // SettingLogMaxLines (shares line with LogMaxSize)
+			28, // SettingRemoveOrphans
+			31, // SettingGlobalSearchEnabled
+			32, // SettingSearchTier
+			33, // SettingRecentDays
+			36, // SettingShowOutput
+			37, // SettingShowAnalytics
+			40, // SettingMaintenanceEnabled
 		}
 		cursorLine := cursorToLine[s.cursor]
 

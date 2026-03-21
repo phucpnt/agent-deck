@@ -2,6 +2,7 @@ package session
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -9,28 +10,40 @@ import (
 )
 
 // buildEnvSourceCommand builds shell commands to source .env files before the main command.
-// Returns empty string if no env files are configured.
+// Returns empty string if no env files or theme vars are configured.
 // Order of sourcing (later overrides earlier):
-//  1. Global [shell].env_files (in order)
-//  2. [shell].init_script (for direnv, nvm, etc.)
-//  3. Tool-specific env_file ([claude].env_file, [gemini].env_file, [tools.X].env_file)
-//  4. Inline env vars from [tools.X].env (highest priority)
+//  1. Theme environment (COLORFGBG) for terminal-aware tools
+//  2. Global [shell].env_files (in order)
+//  3. [shell].init_script (for direnv, nvm, etc.)
+//  4. Tool-specific env_file ([claude].env_file, [gemini].env_file, [tools.X].env_file)
+//  5. Inline env vars from [tools.X].env
+//  6. Conductor-specific env from meta.json (highest priority, overrides tool env)
 func (i *Instance) buildEnvSourceCommand() string {
 	var sources []string
+
+	// 1. Theme environment (COLORFGBG) so tools like Codex detect light/dark theme.
+	// Set early so env files or init scripts can override if needed.
+	if themeExport := themeEnvExport(); themeExport != "" {
+		sources = append(sources, themeExport)
+	}
+
 	config, _ := LoadUserConfig()
 	if config == nil {
-		return ""
+		if len(sources) == 0 {
+			return ""
+		}
+		return strings.Join(sources, " && ") + " && "
 	}
 
 	ignoreMissing := config.Shell.GetIgnoreMissingEnvFiles()
 
-	// 1. Global env_files from [shell] section
+	// 2. Global env_files from [shell] section
 	for _, envFile := range config.Shell.EnvFiles {
 		resolved := resolvePath(envFile, i.ProjectPath)
 		sources = append(sources, buildSourceCmd(resolved, ignoreMissing))
 	}
 
-	// 2. Shell init script (direnv, nvm, pyenv, etc.)
+	// 3. Shell init script (direnv, nvm, pyenv, etc.)
 	if config.Shell.InitScript != "" {
 		script := config.Shell.InitScript
 		if isFilePath(script) {
@@ -42,16 +55,21 @@ func (i *Instance) buildEnvSourceCommand() string {
 		}
 	}
 
-	// 3. Tool-specific env_file
+	// 4. Tool-specific env_file
 	toolEnvFile := i.getToolEnvFile()
 	if toolEnvFile != "" {
 		resolved := resolvePath(toolEnvFile, i.ProjectPath)
 		sources = append(sources, buildSourceCmd(resolved, ignoreMissing))
 	}
 
-	// 4. Inline env vars from [tools.X].env (highest priority)
+	// 5. Inline env vars from [tools.X].env
 	if inlineEnv := i.getToolInlineEnv(); inlineEnv != "" {
 		sources = append(sources, inlineEnv)
+	}
+
+	// 6. Conductor-specific env (highest priority, overrides tool env)
+	if conductorEnv := i.getConductorEnv(ignoreMissing); conductorEnv != "" {
+		sources = append(sources, conductorEnv)
 	}
 
 	if len(sources) == 0 {
@@ -60,6 +78,67 @@ func (i *Instance) buildEnvSourceCommand() string {
 
 	// Join all sources with && and add trailing && for the main command
 	return strings.Join(sources, " && ") + " && "
+}
+
+// themeEnvExport returns a shell export command for COLORFGBG based on the
+// resolved agent-deck theme. This allows terminal-aware tools (Codex, vim, etc.)
+// running inside tmux to detect the correct light/dark background.
+// Returns empty string if the parent terminal already has COLORFGBG set and
+// it matches the resolved theme (avoid unnecessary override).
+func themeEnvExport() string {
+	theme := ResolveTheme()
+
+	// Determine the COLORFGBG value for the resolved theme.
+	// Format: "foreground;background" using terminal color indices.
+	// Background >= 8 signals a light terminal to most tools.
+	var colorfgbg string
+	switch theme {
+	case "light":
+		colorfgbg = "0;15" // black on white
+	default:
+		colorfgbg = "15;0" // white on black
+	}
+
+	// If the parent terminal already has the matching COLORFGBG, propagate
+	// its exact value (it may encode more nuance than our synthetic value).
+	if existing := os.Getenv("COLORFGBG"); existing != "" {
+		if matchesTheme, ok := colorfgbgMatchesTheme(existing, theme); ok && matchesTheme {
+			colorfgbg = existing
+		}
+	}
+
+	return fmt.Sprintf("export COLORFGBG='%s'", colorfgbg)
+}
+
+// ThemeColorFGBG returns the COLORFGBG value for the current resolved theme.
+// Used by tmux session setup to persist the value via set-environment.
+func ThemeColorFGBG() string {
+	theme := ResolveTheme()
+	if existing := os.Getenv("COLORFGBG"); existing != "" {
+		if matchesTheme, ok := colorfgbgMatchesTheme(existing, theme); ok && matchesTheme {
+			return existing
+		}
+	}
+	if theme == "light" {
+		return "0;15"
+	}
+	return "15;0"
+}
+
+// colorfgbgMatchesTheme checks if a COLORFGBG value matches the given theme.
+// Returns (matches, parsedOK). Background index >= 8 is considered light.
+func colorfgbgMatchesTheme(colorfgbg, theme string) (bool, bool) {
+	idx := strings.LastIndex(colorfgbg, ";")
+	if idx < 0 {
+		return false, false
+	}
+	bgStr := colorfgbg[idx+1:]
+	var bg int
+	if _, err := fmt.Sscanf(bgStr, "%d", &bg); err != nil {
+		return false, false
+	}
+	isLight := bg >= 8
+	return (theme == "light") == isLight, true
 }
 
 // buildSourceCmd creates a shell command to source a file.
@@ -169,4 +248,63 @@ func (i *Instance) getToolEnvFile() string {
 		}
 	}
 	return ""
+}
+
+// getConductorEnv returns shell export commands for conductor-specific env vars.
+// Checks if this session is a conductor (title starts with "conductor-") and loads
+// env and env_file from the conductor's meta.json.
+func (i *Instance) getConductorEnv(ignoreMissing bool) string {
+	name := strings.TrimPrefix(i.Title, "conductor-")
+	if name == "" || name == i.Title {
+		return "" // not a conductor session
+	}
+	meta, err := LoadConductorMeta(name)
+	if err != nil {
+		sessionLog.Warn("conductor_env_load_failed",
+			slog.String("conductor", name),
+			slog.String("error", err.Error()))
+		return ""
+	}
+
+	var parts []string
+
+	// Conductor env_file
+	if meta.EnvFile != "" {
+		resolved := resolvePath(meta.EnvFile, i.ProjectPath)
+		parts = append(parts, buildSourceCmd(resolved, ignoreMissing))
+	}
+
+	// Conductor inline env vars
+	if len(meta.Env) > 0 {
+		keys := make([]string, 0, len(meta.Env))
+		for k := range meta.Env {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			if !isValidEnvKey(k) {
+				continue // skip invalid env var names
+			}
+			parts = append(parts, fmt.Sprintf("export %s='%s'", k, strings.ReplaceAll(meta.Env[k], "'", "'\\''")))
+		}
+	}
+
+	return strings.Join(parts, " && ")
+}
+
+// isValidEnvKey checks that a string is a valid environment variable name.
+func isValidEnvKey(key string) bool {
+	if key == "" {
+		return false
+	}
+	for i, c := range key {
+		if c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c == '_' {
+			continue
+		}
+		if i > 0 && c >= '0' && c <= '9' {
+			continue
+		}
+		return false
+	}
+	return true
 }

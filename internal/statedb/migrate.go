@@ -48,9 +48,12 @@ type jsonInstanceData struct {
 	CodexSessionID  string    `json:"codex_session_id,omitempty"`
 	CodexDetectedAt time.Time `json:"codex_detected_at,omitempty"`
 
-	LatestPrompt    string          `json:"latest_prompt,omitempty"`
-	ToolOptionsJSON json.RawMessage `json:"tool_options,omitempty"`
-	LoadedMCPNames  []string        `json:"loaded_mcp_names,omitempty"`
+	LatestPrompt     string          `json:"latest_prompt,omitempty"`
+	Notes            string          `json:"notes,omitempty"`
+	ToolOptionsJSON  json.RawMessage `json:"tool_options,omitempty"`
+	LoadedMCPNames   []string        `json:"loaded_mcp_names,omitempty"`
+	Sandbox          json.RawMessage `json:"sandbox,omitempty"`
+	SandboxContainer string          `json:"sandbox_container,omitempty"`
 }
 
 // jsonGroupData mirrors session.GroupData for migration.
@@ -75,8 +78,26 @@ type toolDataBlob struct {
 	CodexSessionID     string          `json:"codex_session_id,omitempty"`
 	CodexDetectedAt    int64           `json:"codex_detected_at,omitempty"`
 	LatestPrompt       string          `json:"latest_prompt,omitempty"`
+	Notes              string          `json:"notes,omitempty"`
 	LoadedMCPNames     []string        `json:"loaded_mcp_names,omitempty"`
 	ToolOptions        json.RawMessage `json:"tool_options,omitempty"`
+	Sandbox            json.RawMessage `json:"sandbox,omitempty"`
+	SandboxContainer   string          `json:"sandbox_container,omitempty"`
+	SSHHost            string          `json:"ssh_host,omitempty"`
+	SSHRemotePath      string          `json:"ssh_remote_path,omitempty"`
+	// Multi-repo support
+	MultiRepoEnabled   bool                    `json:"multi_repo_enabled,omitempty"`
+	AdditionalPaths    []string                `json:"additional_paths,omitempty"`
+	MultiRepoTempDir   string                  `json:"multi_repo_temp_dir,omitempty"`
+	MultiRepoWorktrees []multiRepoWorktreeBlob `json:"multi_repo_worktrees,omitempty"`
+}
+
+// multiRepoWorktreeBlob is the JSON representation of a multi-repo worktree in tool_data.
+type multiRepoWorktreeBlob struct {
+	OriginalPath string `json:"original_path"`
+	WorktreePath string `json:"worktree_path"`
+	RepoRoot     string `json:"repo_root"`
+	Branch       string `json:"branch"`
 }
 
 // MigrateFromJSON reads a sessions.json file and inserts all data into the StateDB.
@@ -103,8 +124,11 @@ func MigrateFromJSON(jsonPath string, db *StateDB) (int, int, error) {
 			OpenCodeSessionID: inst.OpenCodeSessionID,
 			CodexSessionID:    inst.CodexSessionID,
 			LatestPrompt:      inst.LatestPrompt,
+			Notes:             inst.Notes,
 			LoadedMCPNames:    inst.LoadedMCPNames,
 			ToolOptions:       inst.ToolOptionsJSON,
+			Sandbox:           inst.Sandbox,
+			SandboxContainer:  inst.SandboxContainer,
 		}
 		if !inst.ClaudeDetectedAt.IsZero() {
 			td.ClaudeDetectedAt = inst.ClaudeDetectedAt.Unix()
@@ -172,14 +196,26 @@ func MigrateFromJSON(jsonPath string, db *StateDB) (int, int, error) {
 
 // MarshalToolData creates a tool_data JSON blob from individual fields.
 // This is the forward path: Instance fields -> JSON blob for SQLite storage.
+// MultiRepoWorktreeData holds multi-repo worktree info for serialization.
+type MultiRepoWorktreeData struct {
+	OriginalPath string
+	WorktreePath string
+	RepoRoot     string
+	Branch       string
+}
+
 func MarshalToolData(
 	claudeSessionID string, claudeDetectedAt time.Time,
 	geminiSessionID string, geminiDetectedAt time.Time,
 	geminiYoloMode *bool, geminiModel string,
 	openCodeSessionID string, openCodeDetectedAt time.Time,
 	codexSessionID string, codexDetectedAt time.Time,
-	latestPrompt string, loadedMCPNames []string,
+	latestPrompt string, notes string, loadedMCPNames []string,
 	toolOptionsJSON json.RawMessage,
+	sandboxJSON json.RawMessage, sandboxContainer string,
+	sshHost string, sshRemotePath string,
+	multiRepoEnabled bool, additionalPaths []string,
+	multiRepoTempDir string, multiRepoWorktrees []MultiRepoWorktreeData,
 ) json.RawMessage {
 	td := toolDataBlob{
 		ClaudeSessionID:   claudeSessionID,
@@ -189,8 +225,19 @@ func MarshalToolData(
 		OpenCodeSessionID: openCodeSessionID,
 		CodexSessionID:    codexSessionID,
 		LatestPrompt:      latestPrompt,
+		Notes:             notes,
 		LoadedMCPNames:    loadedMCPNames,
 		ToolOptions:       toolOptionsJSON,
+		Sandbox:           sandboxJSON,
+		SandboxContainer:  sandboxContainer,
+		SSHHost:           sshHost,
+		SSHRemotePath:     sshRemotePath,
+		MultiRepoEnabled:  multiRepoEnabled,
+		AdditionalPaths:   additionalPaths,
+		MultiRepoTempDir:  multiRepoTempDir,
+	}
+	for _, wt := range multiRepoWorktrees {
+		td.MultiRepoWorktrees = append(td.MultiRepoWorktrees, multiRepoWorktreeBlob(wt))
 	}
 	if !claudeDetectedAt.IsZero() {
 		td.ClaudeDetectedAt = claudeDetectedAt.Unix()
@@ -216,8 +263,12 @@ func UnmarshalToolData(data json.RawMessage) (
 	geminiYoloMode *bool, geminiModel string,
 	openCodeSessionID string, openCodeDetectedAt time.Time,
 	codexSessionID string, codexDetectedAt time.Time,
-	latestPrompt string, loadedMCPNames []string,
+	latestPrompt string, notes string, loadedMCPNames []string,
 	toolOptionsJSON json.RawMessage,
+	sandboxJSON json.RawMessage, sandboxContainer string,
+	sshHost string, sshRemotePath string,
+	multiRepoEnabled bool, additionalPaths []string,
+	multiRepoTempDir string, multiRepoWorktrees []MultiRepoWorktreeData,
 ) {
 	if len(data) == 0 {
 		return
@@ -245,7 +296,18 @@ func UnmarshalToolData(data json.RawMessage) (
 		codexDetectedAt = time.Unix(td.CodexDetectedAt, 0)
 	}
 	latestPrompt = td.LatestPrompt
+	notes = td.Notes
 	loadedMCPNames = td.LoadedMCPNames
 	toolOptionsJSON = td.ToolOptions
+	sandboxJSON = td.Sandbox
+	sandboxContainer = td.SandboxContainer
+	sshHost = td.SSHHost
+	sshRemotePath = td.SSHRemotePath
+	multiRepoEnabled = td.MultiRepoEnabled
+	additionalPaths = td.AdditionalPaths
+	multiRepoTempDir = td.MultiRepoTempDir
+	for _, wt := range td.MultiRepoWorktrees {
+		multiRepoWorktrees = append(multiRepoWorktrees, MultiRepoWorktreeData(wt))
+	}
 	return
 }

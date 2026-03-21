@@ -55,6 +55,8 @@ func (d *PromptDetector) HasPrompt(content string) bool {
 		return strings.Contains(content, "press enter to send") ||
 			strings.Contains(content, "Ask anything") ||
 			strings.Contains(content, "open code") ||
+			strings.Contains(content, "enter submit") ||
+			strings.Contains(content, "esc dismiss") ||
 			d.hasLineEndingWith(content, ">")
 
 	case "gemini":
@@ -68,8 +70,16 @@ func (d *PromptDetector) HasPrompt(content string) bool {
 			strings.Contains(lower, "ctrl+c to interrupt") {
 			return false
 		}
-		return strings.Contains(content, "codex>") ||
-			strings.Contains(content, "Continue?")
+		// Direct prompt strings
+		if strings.Contains(content, "codex>") ||
+			strings.Contains(content, "Continue?") ||
+			strings.Contains(content, "How can I help") {
+			return true
+		}
+		// Codex uses › (U+203A) as its prompt marker, similar to Claude's ❯.
+		// The prompt appears as "› suggestion text" near the bottom of the pane
+		// with a status bar (model · path · branch · usage) below it.
+		return d.hasCodexPromptMarker(content)
 
 	default:
 		// Generic shell - check for common prompts
@@ -322,6 +332,34 @@ func (d *PromptDetector) hasClaudePrompt(content string) bool {
 	return false
 }
 
+// hasCodexPromptMarker detects the › (U+203A) prompt marker used by Codex CLI.
+// Codex renders its prompt as:
+//
+//	› Run /review on my current changes
+//	  gpt-5.4 · ~/path/to/project · branch · 100% left · 0% used
+//
+// The marker appears at (or near) the start of a line in the last few lines.
+func (d *PromptDetector) hasCodexPromptMarker(content string) bool {
+	lines := strings.Split(content, "\n")
+	// Check last 10 non-empty lines (prompt may not be the very last line
+	// due to the status bar below it).
+	var lastLines []string
+	for i := len(lines) - 1; i >= 0 && len(lastLines) < 10; i-- {
+		line := strings.TrimSpace(lines[i])
+		if line != "" {
+			lastLines = append(lastLines, line)
+		}
+	}
+	for _, line := range lastLines {
+		clean := strings.TrimSpace(StripANSI(line))
+		if clean == "›" || clean == "› " ||
+			strings.HasPrefix(clean, "› ") {
+			return true
+		}
+	}
+	return false
+}
+
 // hasGeminiPrompt detects if Gemini CLI is waiting for input.
 // Checks last 10 non-blank lines for known Gemini prompt patterns.
 func (d *PromptDetector) hasGeminiPrompt(content string) bool {
@@ -420,23 +458,15 @@ func (d *PromptDetector) hasShellPrompt(content string) bool {
 
 // hasOpencodeBusyIndicator checks if opencode's TUI shows signs of active processing.
 // OpenCode uses a Bubble Tea TUI with these busy signals:
-//   - Help bar: "esc" to cancel (only during processing)
+//   - Help bar: "esc interrupt" / "esc to exit" (only during processing)
 //   - Pulse spinner: █ ▓ ▒ ░ (cycles at 125ms)
 //   - Task text: "Thinking...", "Generating...", etc.
 func (d *PromptDetector) hasOpencodeBusyIndicator(content string) bool {
-	// "esc interrupt" or "esc to exit" in help bar = processing
+	// Authoritative busy indicators: always override prompt detection.
 	if strings.Contains(content, "esc interrupt") || strings.Contains(content, "esc to exit") {
 		return true
 	}
-	// Pulse spinner characters (spinner.Pulse from Bubble Tea)
-	// These only appear on the spinner line when opencode is actively working
-	pulseChars := []string{"█", "▓", "▒", "░"}
-	for _, ch := range pulseChars {
-		if strings.Contains(content, ch) {
-			return true
-		}
-	}
-	// Task text patterns shown next to the spinner
+	// Authoritative busy task text.
 	busyStrings := []string{
 		"Thinking...",
 		"Generating...",
@@ -446,6 +476,22 @@ func (d *PromptDetector) hasOpencodeBusyIndicator(content string) bool {
 	for _, s := range busyStrings {
 		if strings.Contains(content, s) {
 			return true
+		}
+	}
+	// Pulse spinner chars: only indicate busy when no prompt-indicating strings
+	// are present. This prevents false positives when pulse chars appear in
+	// static UI elements (progress bars, decorative borders) alongside
+	// question tool prompts. (#255)
+	hasPromptIndicator := strings.Contains(content, "enter submit") ||
+		strings.Contains(content, "esc dismiss") ||
+		strings.Contains(content, "press enter to send") ||
+		strings.Contains(content, "Ask anything")
+	if !hasPromptIndicator {
+		pulseChars := []string{"█", "▓", "▒", "░"}
+		for _, ch := range pulseChars {
+			if strings.Contains(content, ch) {
+				return true
+			}
 		}
 	}
 	return false

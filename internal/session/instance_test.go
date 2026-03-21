@@ -5,10 +5,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
+	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/asheshgoplani/agent-deck/internal/docker"
 	"github.com/stretchr/testify/require"
 )
 
@@ -126,15 +130,15 @@ func TestInstance_Fork(t *testing.T) {
 		t.Errorf("Fork() failed: %v", err)
 	}
 
-	// Command should use uuidgen + --session-id pattern (instant, no API call)
+	// Command should use Go-side UUID + --session-id pattern (no shell uuidgen dependency)
 	// When not explicitly configured, CLAUDE_CONFIG_DIR should NOT be set
 	// (allows shell environment to take precedence)
 	if strings.Contains(cmd, "CLAUDE_CONFIG_DIR=") {
 		t.Errorf("Fork() should NOT set CLAUDE_CONFIG_DIR when not explicitly configured, got: %s", cmd)
 	}
-	// Step 1: Pre-generate UUID with uuidgen
-	if !strings.Contains(cmd, "uuidgen") {
-		t.Errorf("Fork() should use uuidgen for session ID, got: %s", cmd)
+	// Must NOT use shell uuidgen (replaced with Go-side generateUUID())
+	if strings.Contains(cmd, "uuidgen") {
+		t.Errorf("Fork() should NOT use shell uuidgen (replaced with Go-side UUID), got: %s", cmd)
 	}
 	// Should NOT use -p "." or jq (old capture-resume pattern)
 	if strings.Contains(cmd, `-p "."`) {
@@ -143,17 +147,22 @@ func TestInstance_Fork(t *testing.T) {
 	if strings.Contains(cmd, "jq") {
 		t.Errorf("Fork() should NOT use jq (old pattern), got: %s", cmd)
 	}
-	// Step 2: Use --session-id flag with pre-generated UUID
-	if !strings.Contains(cmd, `--session-id "$session_id"`) {
+	// Must use --session-id flag with a literal Go-generated UUID
+	if !strings.Contains(cmd, "--session-id") {
 		t.Errorf("Fork() should use --session-id flag, got: %s", cmd)
 	}
-	// Step 3: Include --resume with parent ID and --fork-session
+	// Must NOT use shell variable substitution for session ID
+	if strings.Contains(cmd, `--session-id "$session_id"`) {
+		t.Errorf("Fork() should NOT use shell variable for session ID, got: %s", cmd)
+	}
+	// Include --resume with parent ID and --fork-session
 	if !strings.Contains(cmd, "--resume abc-123 --fork-session") {
 		t.Errorf("Fork() should include resume and fork-session flags, got: %s", cmd)
 	}
-	// Step 4: Store session ID in tmux environment
-	if !strings.Contains(cmd, "tmux set-environment CLAUDE_SESSION_ID") {
-		t.Errorf("Fork() should store session ID in tmux env, got: %s", cmd)
+	// CLAUDE_SESSION_ID must NOT be embedded in the shell command string;
+	// it is propagated via host-side SetEnvironment after tmux start.
+	if strings.Contains(cmd, "tmux set-environment CLAUDE_SESSION_ID") {
+		t.Errorf("Fork() should NOT embed tmux set-environment (use host-side SetEnvironment), got: %s", cmd)
 	}
 }
 
@@ -184,6 +193,38 @@ func TestInstance_Fork_ExplicitConfig(t *testing.T) {
 	// When explicitly configured, CLAUDE_CONFIG_DIR SHOULD be set
 	if !strings.Contains(cmd, "CLAUDE_CONFIG_DIR=/tmp/test-claude-config") {
 		t.Errorf("Fork() should set CLAUDE_CONFIG_DIR when explicitly configured, got: %s", cmd)
+	}
+}
+
+func TestInstance_CreateForkedInstance_ExportsForkedInstanceID(t *testing.T) {
+	origConfigDir := os.Getenv("CLAUDE_CONFIG_DIR")
+	origHome := os.Getenv("HOME")
+	os.Unsetenv("CLAUDE_CONFIG_DIR")
+	os.Setenv("HOME", t.TempDir())
+	ClearUserConfigCache()
+	defer func() {
+		if origConfigDir != "" {
+			os.Setenv("CLAUDE_CONFIG_DIR", origConfigDir)
+		}
+		os.Setenv("HOME", origHome)
+		ClearUserConfigCache()
+	}()
+
+	inst := NewInstanceWithTool("test", "/tmp/test", "claude")
+	inst.ClaudeSessionID = "abc-123"
+	inst.ClaudeDetectedAt = time.Now()
+
+	forked, cmd, err := inst.CreateForkedInstance("forked-test", "")
+	if err != nil {
+		t.Fatalf("CreateForkedInstance() failed: %v", err)
+	}
+
+	expectedPrefix := "AGENTDECK_INSTANCE_ID=" + forked.ID
+	if !strings.Contains(cmd, expectedPrefix) {
+		t.Fatalf("Fork command should contain %q, got: %s", expectedPrefix, cmd)
+	}
+	if strings.Contains(cmd, "AGENTDECK_INSTANCE_ID="+inst.ID) {
+		t.Fatalf("Fork command should not export the parent instance ID, got: %s", cmd)
 	}
 }
 
@@ -338,19 +379,23 @@ func TestBuildClaudeCommand(t *testing.T) {
 		t.Errorf("Should NOT contain CLAUDE_CONFIG_DIR when not explicitly configured, got: %s", cmd)
 	}
 
-	// Should use pre-generated UUID pattern with uuidgen
-	if !strings.Contains(cmd, "uuidgen") {
-		t.Errorf("Should use uuidgen for UUID generation, got: %s", cmd)
+	// Must NOT use shell uuidgen (replaced with Go-side generateUUID())
+	if strings.Contains(cmd, "uuidgen") {
+		t.Errorf("Should NOT use shell uuidgen (replaced with Go-side UUID), got: %s", cmd)
 	}
 
-	// Should store session ID in tmux environment
-	if !strings.Contains(cmd, "tmux set-environment CLAUDE_SESSION_ID") {
-		t.Errorf("Should store session ID in tmux env, got: %s", cmd)
+	// CLAUDE_SESSION_ID must NOT be in the shell command string;
+	// it is propagated via host-side SetEnvironment after tmux start.
+	if strings.Contains(cmd, "tmux set-environment CLAUDE_SESSION_ID") {
+		t.Errorf("Should NOT embed tmux set-environment (use host-side SetEnvironment), got: %s", cmd)
 	}
 
-	// Should use --session-id flag for new sessions
-	if !strings.Contains(cmd, `--session-id "$session_id"`) {
+	// Should use --session-id flag for new sessions with a literal UUID (not $session_id)
+	if !strings.Contains(cmd, "--session-id") {
 		t.Errorf("Should use --session-id flag for new sessions, got: %s", cmd)
+	}
+	if strings.Contains(cmd, `--session-id "$session_id"`) {
+		t.Errorf("Should NOT use shell variable for session ID, got: %s", cmd)
 	}
 
 	// Should NOT use capture-resume pattern anymore
@@ -367,11 +412,12 @@ func TestBuildClaudeCommand(t *testing.T) {
 	// Note: --dangerously-skip-permissions is conditional on user config (dangerous_mode)
 	// The command should work with or without it depending on config
 
-	// Test with non-claude tool (should not modify)
+	// Test with non-claude tool (inner command should not be modified,
+	// though env prefix like COLORFGBG may be prepended by buildEnvSourceCommand)
 	shellInst := NewInstance("shell-test", "/tmp/test")
 	shellCmd := shellInst.buildClaudeCommand("bash")
-	if shellCmd != "bash" {
-		t.Errorf("Non-claude command should not be modified, got: %s", shellCmd)
+	if !strings.HasSuffix(shellCmd, "bash") {
+		t.Errorf("Non-claude command should end with 'bash', got: %s", shellCmd)
 	}
 }
 
@@ -400,19 +446,20 @@ func TestBuildClaudeCommand_ExplicitConfig(t *testing.T) {
 		t.Errorf("Should contain CLAUDE_CONFIG_DIR when explicitly configured, got: %s", cmd)
 	}
 
-	// Should use --session-id pattern with explicit config
-	if !strings.Contains(cmd, `--session-id "$session_id"`) {
+	// Should use --session-id flag with a literal Go-generated UUID
+	if !strings.Contains(cmd, "--session-id") {
 		t.Errorf("Should use --session-id flag with explicit config, got: %s", cmd)
 	}
-	if !strings.Contains(cmd, "uuidgen") {
-		t.Errorf("Should use uuidgen with explicit config, got: %s", cmd)
+	if strings.Contains(cmd, `--session-id "$session_id"`) {
+		t.Errorf("Should NOT use shell variable for session ID, got: %s", cmd)
+	}
+	// Must NOT use shell uuidgen (replaced with Go-side generateUUID())
+	if strings.Contains(cmd, "uuidgen") {
+		t.Errorf("Should NOT use shell uuidgen (replaced with Go-side UUID), got: %s", cmd)
 	}
 }
 
-// TestBuildClaudeCommand_CustomAlias tests that capture-resume commands always use
-// "claude" binary + CLAUDE_CONFIG_DIR, NOT the custom alias (aliases don't work in bash -c)
 func TestBuildClaudeCommand_CustomAlias(t *testing.T) {
-	// Create temp config with custom command
 	origHome := os.Getenv("HOME")
 	tmpDir := t.TempDir()
 	os.Setenv("HOME", tmpDir)
@@ -439,11 +486,8 @@ config_dir = "~/.claude-work"
 	inst := NewInstanceWithTool("test", "/tmp/test", "claude")
 	cmd := inst.buildClaudeCommand("claude")
 
-	// Should use "claude" binary (NOT "cdw" alias) for capture-resume commands
-	// Reason: Commands with $(...) get wrapped in `bash -c` for fish compatibility (#47),
-	// and shell aliases are not available in non-interactive bash shells
-	if strings.Contains(cmd, "cdw") {
-		t.Errorf("Should NOT use alias 'cdw' in capture-resume command (aliases don't work in bash -c), got: %s", cmd)
+	if !strings.Contains(cmd, "cdw") {
+		t.Errorf("Should use custom command 'cdw' from config, got: %s", cmd)
 	}
 
 	// Should include CLAUDE_CONFIG_DIR since config_dir is explicitly set
@@ -451,9 +495,112 @@ config_dir = "~/.claude-work"
 		t.Errorf("Should include CLAUDE_CONFIG_DIR for capture-resume commands, got: %s", cmd)
 	}
 
-	// Should use --session-id pattern (pre-generated UUID, instant start)
-	if !strings.Contains(cmd, `--session-id "$session_id"`) {
+	// Should use --session-id with a literal Go-generated UUID (not shell variable)
+	if !strings.Contains(cmd, "--session-id") {
 		t.Errorf("Should use --session-id flag for instant start pattern, got: %s", cmd)
+	}
+	if strings.Contains(cmd, `--session-id "$session_id"`) {
+		t.Errorf("Should NOT use shell variable for session ID, got: %s", cmd)
+	}
+}
+
+func TestBuildClaudeCommand_UseHappy(t *testing.T) {
+	origHome := os.Getenv("HOME")
+	tmpDir := t.TempDir()
+	os.Setenv("HOME", tmpDir)
+
+	configDir := filepath.Join(tmpDir, ".agent-deck")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatalf("failed to create config dir: %v", err)
+	}
+	configContent := `[claude]
+use_happy = true
+`
+	if err := os.WriteFile(filepath.Join(configDir, "config.toml"), []byte(configContent), 0o644); err != nil {
+		t.Fatalf("failed to write config file: %v", err)
+	}
+
+	ClearUserConfigCache()
+	defer func() {
+		os.Setenv("HOME", origHome)
+		ClearUserConfigCache()
+	}()
+
+	inst := NewInstanceWithTool("happy-claude", "/tmp/test", "claude")
+	cmd := inst.buildClaudeCommand("claude")
+
+	if !strings.Contains(cmd, "exec happy --session-id") {
+		t.Errorf("Should launch Claude via happy when use_happy=true, got: %s", cmd)
+	}
+}
+
+func TestBuildClaudeCommand_CustomAliasWinsOverHappy(t *testing.T) {
+	origHome := os.Getenv("HOME")
+	tmpDir := t.TempDir()
+	os.Setenv("HOME", tmpDir)
+
+	configDir := filepath.Join(tmpDir, ".agent-deck")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatalf("failed to create config dir: %v", err)
+	}
+	configContent := `[claude]
+command = "cdw"
+use_happy = true
+`
+	if err := os.WriteFile(filepath.Join(configDir, "config.toml"), []byte(configContent), 0o644); err != nil {
+		t.Fatalf("failed to write config file: %v", err)
+	}
+
+	ClearUserConfigCache()
+	defer func() {
+		os.Setenv("HOME", origHome)
+		ClearUserConfigCache()
+	}()
+
+	inst := NewInstanceWithTool("alias-claude", "/tmp/test", "claude")
+	cmd := inst.buildClaudeCommand("claude")
+
+	if !strings.Contains(cmd, "cdw") {
+		t.Errorf("Should use custom Claude command when configured, got: %s", cmd)
+	}
+	if strings.Contains(cmd, "exec happy") {
+		t.Errorf("Custom Claude command should win over happy, got: %s", cmd)
+	}
+}
+
+func TestBuildClaudeCommand_PerSessionUseHappyOverride(t *testing.T) {
+	origHome := os.Getenv("HOME")
+	tmpDir := t.TempDir()
+	os.Setenv("HOME", tmpDir)
+
+	configDir := filepath.Join(tmpDir, ".agent-deck")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatalf("failed to create config dir: %v", err)
+	}
+	configContent := `[claude]
+use_happy = true
+`
+	if err := os.WriteFile(filepath.Join(configDir, "config.toml"), []byte(configContent), 0o644); err != nil {
+		t.Fatalf("failed to write config file: %v", err)
+	}
+
+	ClearUserConfigCache()
+	defer func() {
+		os.Setenv("HOME", origHome)
+		ClearUserConfigCache()
+	}()
+
+	inst := NewInstanceWithTool("plain-claude", "/tmp/test", "claude")
+	if err := inst.SetClaudeOptions(&ClaudeOptions{SessionMode: "new", UseHappy: false}); err != nil {
+		t.Fatalf("SetClaudeOptions failed: %v", err)
+	}
+
+	cmd := inst.buildClaudeCommand("claude")
+	if strings.Contains(cmd, "exec happy") {
+		t.Errorf("Per-session UseHappy=false should override global config, got: %s", cmd)
+	}
+	if !strings.Contains(cmd, "exec claude --session-id") {
+		t.Errorf("Expected plain claude command when per-session UseHappy=false, got: %s", cmd)
 	}
 }
 
@@ -506,10 +653,10 @@ func TestCreateForkedInstance_SessionIDPattern(t *testing.T) {
 		t.Fatalf("CreateForkedInstance() failed: %v", err)
 	}
 
-	// Command SHOULD use uuidgen + --session-id pattern (instant, no API call)
-	// Step 1: Pre-generate UUID with uuidgen
-	if !strings.Contains(cmd, "uuidgen") {
-		t.Errorf("Fork command should use uuidgen for session ID, got: %s", cmd)
+	// Command should use Go-side UUID + --session-id pattern (no shell uuidgen dependency)
+	// Must NOT use shell uuidgen (replaced with Go-side generateUUID())
+	if strings.Contains(cmd, "uuidgen") {
+		t.Errorf("Fork command should NOT use shell uuidgen (replaced with Go-side UUID), got: %s", cmd)
 	}
 	// Should NOT use -p "." or jq (old capture-resume pattern)
 	if strings.Contains(cmd, `-p "."`) {
@@ -518,23 +665,26 @@ func TestCreateForkedInstance_SessionIDPattern(t *testing.T) {
 	if strings.Contains(cmd, "jq") {
 		t.Errorf("Fork command should NOT use jq (old pattern), got: %s", cmd)
 	}
-	// Step 2: Use --session-id flag with pre-generated UUID
-	if !strings.Contains(cmd, `--session-id "$session_id"`) {
+	// Must use --session-id flag with a literal Go-generated UUID
+	if !strings.Contains(cmd, "--session-id") {
 		t.Errorf("Fork command should use --session-id flag, got: %s", cmd)
 	}
-	// Step 3: Include --resume with parent ID and --fork-session
+	if strings.Contains(cmd, `--session-id "$session_id"`) {
+		t.Errorf("Fork command should NOT use shell variable for session ID, got: %s", cmd)
+	}
+	// Include --resume with parent ID and --fork-session
 	if !strings.Contains(cmd, "--resume parent-abc-123 --fork-session") {
 		t.Errorf("Fork command should contain --resume with parent ID and --fork-session, got: %s", cmd)
 	}
-	// Step 4: Store session ID in tmux environment
-	if !strings.Contains(cmd, "tmux set-environment CLAUDE_SESSION_ID") {
-		t.Errorf("Fork command should store session ID in tmux env, got: %s", cmd)
+	// CLAUDE_SESSION_ID must NOT be embedded in the shell command string;
+	// it is propagated via host-side SetEnvironment after tmux start.
+	if strings.Contains(cmd, "tmux set-environment CLAUDE_SESSION_ID") {
+		t.Errorf("Fork command should NOT embed tmux set-environment (use host-side SetEnvironment), got: %s", cmd)
 	}
 
-	// Forked instance should have empty ClaudeSessionID initially
-	// (will be populated from tmux env after start)
-	if forked.ClaudeSessionID != "" {
-		t.Errorf("Forked instance should have empty ClaudeSessionID initially, got: %s", forked.ClaudeSessionID)
+	// Forked instance should have its ClaudeSessionID set to the pre-generated UUID.
+	if forked.ClaudeSessionID == "" {
+		t.Errorf("Forked instance should have ClaudeSessionID pre-set by generateUUID()")
 	}
 
 	if forked.Tool != "claude" {
@@ -1219,12 +1369,13 @@ func TestBuildGeminiCommand(t *testing.T) {
 	// "gemini --output-format json ." would hang processing the prompt
 	cmd := inst.buildGeminiCommand("gemini")
 
-	// Should set YOLO mode env and start fresh
-	if !strings.Contains(cmd, "GEMINI_YOLO_MODE") {
-		t.Error("Should set GEMINI_YOLO_MODE env var")
-	}
+	// Should start Gemini fresh (no inline tmux set-environment; host-side SetEnvironment handles it)
 	if !strings.Contains(cmd, "gemini") {
 		t.Errorf("Should start gemini fresh for new session, got %q", cmd)
+	}
+	// GEMINI_YOLO_MODE is now propagated via host-side SetEnvironment, not in the shell string
+	if strings.Contains(cmd, "tmux set-environment GEMINI_YOLO_MODE") {
+		t.Errorf("buildGeminiCommand should NOT embed 'tmux set-environment GEMINI_YOLO_MODE' in shell string, got %q", cmd)
 	}
 	// Should NOT use capture-resume pattern for new sessions
 	if strings.Contains(cmd, "--output-format json") {
@@ -1234,18 +1385,15 @@ func TestBuildGeminiCommand(t *testing.T) {
 		t.Error("Should NOT use --resume for new sessions without session ID")
 	}
 
-	// With session ID, should use simple resume with YOLO env var
+	// With session ID, should use simple resume (no inline tmux set-environment)
 	inst.GeminiSessionID = "abc-123-def"
 	cmd = inst.buildGeminiCommand("gemini")
 	if !strings.Contains(cmd, "gemini --resume abc-123-def") {
 		t.Errorf("buildGeminiCommand('gemini') should contain resume command, got %q", cmd)
 	}
-	if !strings.Contains(cmd, "GEMINI_YOLO_MODE") {
-		t.Errorf("buildGeminiCommand('gemini') should set GEMINI_YOLO_MODE env, got %q", cmd)
-	}
-	// Resume should set GEMINI_SESSION_ID in tmux env
-	if !strings.Contains(cmd, "tmux set-environment GEMINI_SESSION_ID abc-123-def") {
-		t.Errorf("buildGeminiCommand('gemini') should set GEMINI_SESSION_ID in tmux env on resume, got %q", cmd)
+	// GEMINI_YOLO_MODE and GEMINI_SESSION_ID are now propagated via host-side SetEnvironment
+	if strings.Contains(cmd, "tmux set-environment") {
+		t.Errorf("buildGeminiCommand('gemini') should NOT embed 'tmux set-environment' in shell string, got %q", cmd)
 	}
 
 	// With explicit model set, should include --model flag
@@ -1508,8 +1656,9 @@ func TestInstance_ForkOpenCode(t *testing.T) {
 	if !strings.Contains(script, "ses_abc123def456ffe1234567890abcd") {
 		t.Errorf("Fork script should include original session ID, got: %s", script)
 	}
-	if !strings.Contains(script, "tmux set-environment OPENCODE_SESSION_ID") {
-		t.Errorf("Fork script should set tmux environment, got: %s", script)
+	// tmux set-environment removed: host-side SetEnvironment handles propagation
+	if strings.Contains(script, "tmux set-environment") {
+		t.Errorf("Fork script should NOT contain tmux set-environment (host-side handles it), got: %s", script)
 	}
 }
 
@@ -2188,6 +2337,8 @@ func TestNewSandboxConfig(t *testing.T) {
 			require.Equal(t, tc.wantEnabled, cfg.Enabled)
 			if tc.imageOverride != "" {
 				require.Equal(t, tc.imageOverride, cfg.Image)
+			} else {
+				require.Equal(t, docker.DefaultImage(), cfg.Image)
 			}
 		})
 	}
@@ -2265,6 +2416,147 @@ func TestBuildClaudeCommand_ExportsInstanceID(t *testing.T) {
 	expectedPrefix := "AGENTDECK_INSTANCE_ID=" + inst.ID
 	if !strings.Contains(cmd, expectedPrefix) {
 		t.Errorf("Command should contain %q, got: %s", expectedPrefix, cmd)
+	}
+}
+
+func TestBuildCodexCommand_UseHappy(t *testing.T) {
+	origHome := os.Getenv("HOME")
+	tmpDir := t.TempDir()
+	os.Setenv("HOME", tmpDir)
+
+	configDir := filepath.Join(tmpDir, ".agent-deck")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatalf("failed to create config dir: %v", err)
+	}
+	configContent := `[codex]
+use_happy = true
+yolo_mode = true
+`
+	if err := os.WriteFile(filepath.Join(configDir, "config.toml"), []byte(configContent), 0o644); err != nil {
+		t.Fatalf("failed to write config file: %v", err)
+	}
+
+	ClearUserConfigCache()
+	defer func() {
+		os.Setenv("HOME", origHome)
+		ClearUserConfigCache()
+	}()
+
+	inst := NewInstanceWithTool("happy-codex", "/tmp/test", "codex")
+	cmd := inst.buildCodexCommand("codex")
+
+	if !strings.Contains(cmd, "happy codex --yolo") {
+		t.Errorf("Should launch Codex via happy with yolo flag, got: %s", cmd)
+	}
+}
+
+func TestBuildCodexCommand_PerSessionUseHappyOverride(t *testing.T) {
+	origHome := os.Getenv("HOME")
+	tmpDir := t.TempDir()
+	os.Setenv("HOME", tmpDir)
+
+	configDir := filepath.Join(tmpDir, ".agent-deck")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatalf("failed to create config dir: %v", err)
+	}
+	configContent := `[codex]
+use_happy = true
+`
+	if err := os.WriteFile(filepath.Join(configDir, "config.toml"), []byte(configContent), 0o644); err != nil {
+		t.Fatalf("failed to write config file: %v", err)
+	}
+
+	ClearUserConfigCache()
+	defer func() {
+		os.Setenv("HOME", origHome)
+		ClearUserConfigCache()
+	}()
+
+	inst := NewInstanceWithTool("plain-codex", "/tmp/test", "codex")
+	inst.CodexSessionID = "codex-session-123"
+	if err := inst.SetCodexOptions(&CodexOptions{
+		YoloMode: boolPtr(true),
+		UseHappy: boolPtr(false),
+	}); err != nil {
+		t.Fatalf("SetCodexOptions failed: %v", err)
+	}
+
+	cmd := inst.buildCodexCommand("codex")
+
+	if strings.Contains(cmd, "happy codex") {
+		t.Errorf("Per-session UseHappy=false should override global config, got: %s", cmd)
+	}
+	if !strings.Contains(cmd, "codex --yolo resume codex-session-123") {
+		t.Errorf("Expected plain codex resume command with yolo, got: %s", cmd)
+	}
+}
+
+func TestBuildClaudeResumeCommand_UseHappy(t *testing.T) {
+	origHome := os.Getenv("HOME")
+	tmpDir := t.TempDir()
+	os.Setenv("HOME", tmpDir)
+
+	configDir := filepath.Join(tmpDir, ".agent-deck")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatalf("failed to create config dir: %v", err)
+	}
+	configContent := `[claude]
+use_happy = true
+`
+	if err := os.WriteFile(filepath.Join(configDir, "config.toml"), []byte(configContent), 0o644); err != nil {
+		t.Fatalf("failed to write config file: %v", err)
+	}
+
+	ClearUserConfigCache()
+	defer func() {
+		os.Setenv("HOME", origHome)
+		ClearUserConfigCache()
+	}()
+
+	inst := NewInstanceWithTool("resume-happy", "/tmp/test", "claude")
+	inst.ClaudeSessionID = "resume-session-123"
+	inst.ClaudeDetectedAt = time.Now()
+
+	cmd := inst.buildClaudeResumeCommand()
+	if !strings.Contains(cmd, "happy --session-id resume-session-123") &&
+		!strings.Contains(cmd, "happy --resume resume-session-123") {
+		t.Errorf("Resume command should use happy when configured, got: %s", cmd)
+	}
+}
+
+func TestBuildClaudeForkCommandForTarget_UseHappy(t *testing.T) {
+	origHome := os.Getenv("HOME")
+	tmpDir := t.TempDir()
+	os.Setenv("HOME", tmpDir)
+
+	configDir := filepath.Join(tmpDir, ".agent-deck")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatalf("failed to create config dir: %v", err)
+	}
+	configContent := `[claude]
+use_happy = true
+`
+	if err := os.WriteFile(filepath.Join(configDir, "config.toml"), []byte(configContent), 0o644); err != nil {
+		t.Fatalf("failed to write config file: %v", err)
+	}
+
+	ClearUserConfigCache()
+	defer func() {
+		os.Setenv("HOME", origHome)
+		ClearUserConfigCache()
+	}()
+
+	parent := NewInstanceWithTool("parent", "/tmp/test", "claude")
+	parent.ClaudeSessionID = "parent-session-123"
+	parent.ClaudeDetectedAt = time.Now()
+	target := NewInstanceWithTool("fork", "/tmp/test", "claude")
+
+	cmd, err := parent.buildClaudeForkCommandForTarget(target, nil)
+	if err != nil {
+		t.Fatalf("buildClaudeForkCommandForTarget failed: %v", err)
+	}
+	if !strings.Contains(cmd, "exec happy --session-id") {
+		t.Errorf("Fork command should use happy when configured, got: %s", cmd)
 	}
 }
 
@@ -2433,6 +2725,110 @@ func writeCodexSessionFile(t *testing.T, codexHome, sessionID, cwd string) strin
 	return filePath
 }
 
+func TestExtractCodexSessionIDFromLsofOutput(t *testing.T) {
+	lsofOutput := []byte(`codex 12345 user 45w REG 254,1 654264 5176218 /home/user/.codex/sessions/2026/02/28/rollout-2026-02-28T00-42-18-019c9ffa-c9d6-7be1-9e1c-527080e68951.jsonl
+`)
+
+	got := extractCodexSessionIDFromLsofOutput(lsofOutput)
+	want := "019c9ffa-c9d6-7be1-9e1c-527080e68951"
+	if got != want {
+		t.Fatalf("extractCodexSessionIDFromLsofOutput() = %q, want %q", got, want)
+	}
+}
+
+func TestExtractCodexSessionIDFromLsofOutput_DockerStyleLine(t *testing.T) {
+	lsofOutput := []byte(`codex 44 root 36w REG 0,608 3392413 5176210 /root/.codex/sessions/2026/02/23/rollout-2026-02-23T18-37-01-019c8a12-e903-7670-bd12-709c6a4c5451.jsonl
+`)
+
+	got := extractCodexSessionIDFromLsofOutput(lsofOutput)
+	want := "019c8a12-e903-7670-bd12-709c6a4c5451"
+	if got != want {
+		t.Fatalf("extractCodexSessionIDFromLsofOutput() docker line = %q, want %q", got, want)
+	}
+}
+
+func TestExtractCodexSessionIDFromPath_DeletedSuffix(t *testing.T) {
+	path := "/home/user/.codex/sessions/2026/02/28/rollout-2026-02-28T00-42-18-019c9ffa-c9d6-7be1-9e1c-527080e68951.jsonl (deleted)"
+	got := extractCodexSessionIDFromPath(path)
+	want := "019c9ffa-c9d6-7be1-9e1c-527080e68951"
+	if got != want {
+		t.Fatalf("extractCodexSessionIDFromPath() = %q, want %q", got, want)
+	}
+}
+
+func TestParsePSParentChildMap(t *testing.T) {
+	procTable := []byte("100 1\n101 100\n102 100\n103 101\nbad-line\n104 invalid\n105 0\n")
+	got := parsePSParentChildMap(procTable)
+
+	want := map[int][]int{
+		1:   {100},
+		100: {101, 102},
+		101: {103},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("parsePSParentChildMap() = %#v, want %#v", got, want)
+	}
+}
+
+func TestCollectProcessTreePIDsFromTable(t *testing.T) {
+	procTable := []byte("100 1\n101 100\n102 100\n103 101\n104 999\n")
+	got := collectProcessTreePIDsFromTable(100, procTable)
+	want := []int{100, 101, 102, 103}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("collectProcessTreePIDsFromTable() = %#v, want %#v", got, want)
+	}
+}
+
+func TestCodexProbeMissingWarning(t *testing.T) {
+	if got := codexProbeMissingWarning(""); got != "" {
+		t.Fatalf("codexProbeMissingWarning(\"\") = %q, want empty", got)
+	}
+	want := "Codex session detection fallback: readlink is not available"
+	if got := codexProbeMissingWarning("readlink"); got != want {
+		t.Fatalf("codexProbeMissingWarning(\"readlink\") = %q, want %q", got, want)
+	}
+}
+
+func TestInstance_ConsumeCodexRestartWarning(t *testing.T) {
+	inst := NewInstanceWithTool("codex-warning", "/tmp/test", "codex")
+	inst.pendingCodexRestartWarning = "Codex session detection fallback: lsof is not available"
+
+	if got := inst.ConsumeCodexRestartWarning(); got == "" {
+		t.Fatalf("ConsumeCodexRestartWarning() returned empty warning")
+	}
+	if got := inst.ConsumeCodexRestartWarning(); got != "" {
+		t.Fatalf("second ConsumeCodexRestartWarning() = %q, want empty", got)
+	}
+}
+
+func TestInstance_ConsumeCodexRestartWarning_Concurrent(t *testing.T) {
+	inst := NewInstanceWithTool("codex-warning-concurrent", "/tmp/test", "codex")
+	inst.pendingCodexRestartWarning = "Codex session detection fallback: readlink is not available"
+
+	const workers = 16
+	var wg sync.WaitGroup
+	results := make(chan string, workers)
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results <- inst.ConsumeCodexRestartWarning()
+		}()
+	}
+	wg.Wait()
+	close(results)
+
+	nonEmpty := 0
+	for r := range results {
+		if r != "" {
+			nonEmpty++
+		}
+	}
+	if nonEmpty != 1 {
+		t.Fatalf("non-empty warnings = %d, want 1", nonEmpty)
+	}
+}
+
 // TestInstance_UpdateHookStatus tests the UpdateHookStatus method.
 func TestInstance_UpdateHookStatus(t *testing.T) {
 	inst := NewInstanceWithTool("hook-update-test", "/tmp/test", "claude")
@@ -2467,6 +2863,98 @@ func TestInstance_UpdateHookStatus_Nil(t *testing.T) {
 	}
 }
 
+func TestInstance_UpdateHookStatus_UsesAnchorWhenHookSessionIDMissing_Claude(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	inst := NewInstanceWithTool("hook-anchor-claude", "/tmp/test", "claude")
+	WriteHookSessionAnchor(inst.ID, "anchor-claude-1")
+
+	hookStatus := &HookStatus{
+		Status:    "waiting",
+		SessionID: "",
+		Event:     "Stop",
+		UpdatedAt: time.Now(),
+	}
+	inst.UpdateHookStatus(hookStatus)
+
+	if inst.ClaudeSessionID != "anchor-claude-1" {
+		t.Fatalf("ClaudeSessionID = %q, want anchor-claude-1", inst.ClaudeSessionID)
+	}
+}
+
+func TestInstance_UpdateHookStatus_UsesAnchorWhenHookSessionIDMissing_Codex(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	inst := NewInstanceWithTool("hook-anchor-codex", "/tmp/test", "codex")
+	WriteHookSessionAnchor(inst.ID, "anchor-codex-1")
+
+	hookStatus := &HookStatus{
+		Status:    "waiting",
+		SessionID: "",
+		Event:     "turn/completed",
+		UpdatedAt: time.Now(),
+	}
+	inst.UpdateHookStatus(hookStatus)
+
+	if inst.CodexSessionID != "anchor-codex-1" {
+		t.Fatalf("CodexSessionID = %q, want anchor-codex-1", inst.CodexSessionID)
+	}
+}
+
+func TestInstance_UpdateHookStatus_GeminiRejectsCandidateWithoutConversationData(t *testing.T) {
+	tmpDir := t.TempDir()
+	geminiConfigDirOverride = tmpDir
+	defer func() { geminiConfigDirOverride = "" }()
+
+	inst := NewInstanceWithTool("hook-gemini-reject", "/tmp/test", "gemini")
+	inst.GeminiSessionID = "current-gemini-session"
+
+	hookStatus := &HookStatus{
+		Status:    "waiting",
+		SessionID: "candidate-no-data",
+		Event:     "AfterAgent",
+		UpdatedAt: time.Now(),
+	}
+	inst.UpdateHookStatus(hookStatus)
+
+	if inst.GeminiSessionID != "current-gemini-session" {
+		t.Fatalf("GeminiSessionID = %q, want current-gemini-session", inst.GeminiSessionID)
+	}
+}
+
+func TestInstance_UpdateHookStatus_GeminiAcceptsCandidateWithConversationData(t *testing.T) {
+	tmpDir := t.TempDir()
+	geminiConfigDirOverride = tmpDir
+	defer func() { geminiConfigDirOverride = "" }()
+
+	projectPath := "/tmp/test-gemini-project"
+	inst := NewInstanceWithTool("hook-gemini-accept", projectPath, "gemini")
+	inst.GeminiSessionID = "current-gemini-session"
+
+	candidateID := "11111111-2222-3333-4444-555555555555"
+	sessionsDir := GetGeminiSessionsDir(projectPath)
+	if err := os.MkdirAll(sessionsDir, 0755); err != nil {
+		t.Fatalf("mkdir sessions dir: %v", err)
+	}
+	filePath := filepath.Join(sessionsDir, "session-2026-03-05T10-00-"+candidateID[:8]+".json")
+	content := `{"sessionId":"` + candidateID + `","messages":[{"type":"user","content":"hi"}]}`
+	if err := os.WriteFile(filePath, []byte(content), 0644); err != nil {
+		t.Fatalf("write session file: %v", err)
+	}
+
+	hookStatus := &HookStatus{
+		Status:    "waiting",
+		SessionID: candidateID,
+		Event:     "AfterAgent",
+		UpdatedAt: time.Now(),
+	}
+	inst.UpdateHookStatus(hookStatus)
+
+	if inst.GeminiSessionID != candidateID {
+		t.Fatalf("GeminiSessionID = %q, want %q", inst.GeminiSessionID, candidateID)
+	}
+}
+
 func TestInstance_SetAcknowledgedFromShared_RunningIgnored(t *testing.T) {
 	inst := NewInstanceWithTool("ack-shared-running", "/tmp/test", "codex")
 	inst.Status = StatusRunning
@@ -2489,53 +2977,178 @@ func TestInstance_SetAcknowledgedFromShared_WaitingApplied(t *testing.T) {
 	}
 }
 
-func TestHasUnsentComposerPrompt(t *testing.T) {
-	content := "────────────────\n❯\u00a0Write one line: LAUNCH_OK\n[Opus 4.6] Context: 0%"
-	if !hasUnsentComposerPrompt(content, "Write one line: LAUNCH_OK") {
-		t.Fatal("expected unsent composer prompt to be detected")
-	}
-	if hasUnsentComposerPrompt(content, "Different text") {
-		t.Fatal("did not expect mismatched composer text to be detected")
+// TestUpdateStatus_ColdLoadHookFile verifies that UpdateStatus reads hook status
+// from disk when hookStatus is empty (CLI path without StatusFileWatcher).
+func TestUpdateStatus_ColdLoadHookFile(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	inst := NewInstanceWithTool("cold-load-test", "/tmp/test", "claude")
+
+	// Write a hook status file to disk
+	hooksDir := GetHooksDir()
+	if err := os.MkdirAll(hooksDir, 0755); err != nil {
+		t.Fatal(err)
 	}
 
-	// Submitted messages can appear in history; only current composer should count.
-	submitted := "❯ Write one line: LAUNCH_OK\n✳ Tempering…\n────────────────\n❯\n────────────────\n[Opus 4.6] Context: 0%"
-	if hasUnsentComposerPrompt(submitted, "Write one line: LAUNCH_OK") {
-		t.Fatal("did not expect submitted history line to be treated as unsent composer input")
+	hookData := fmt.Sprintf(`{"status":"waiting","session_id":"cold-sess-1","event":"Stop","ts":%d}`, time.Now().Unix())
+	hookPath := filepath.Join(hooksDir, inst.ID+".json")
+	if err := os.WriteFile(hookPath, []byte(hookData), 0644); err != nil {
+		t.Fatal(err)
 	}
 
-	// Wrapped current composer lines only expose a prefix of the message.
-	wrappedContent := "────────────────\n❯\u00a0Read these 3 files and produce a summary for DIAGTOKEN_123. Keep\n  under 80 lines and include one verdict line.\n────────────────\n[Opus 4.6] Context: 0%"
-	wrappedMessage := "Read these 3 files and produce a summary for DIAGTOKEN_123. Keep under 80 lines and include one verdict line."
-	if !hasUnsentComposerPrompt(wrappedContent, wrappedMessage) {
-		t.Fatal("expected wrapped unsent composer prompt to be detected")
+	// Verify hookStatus starts empty
+	if inst.hookStatus != "" {
+		t.Fatalf("hookStatus should start empty, got %q", inst.hookStatus)
 	}
 
-	// Claude hint suggestions should not be treated as unsent input for a
-	// different message.
-	suggestion := "────────────────\n❯\u00a0Try \"write a test for <filepath>\"\n────────────────\n[Opus 4.6] Context: 0%"
-	if hasUnsentComposerPrompt(suggestion, wrappedMessage) {
-		t.Fatal("did not expect suggestion placeholder to be treated as unsent composer input")
+	// Call UpdateStatus — it will fail early because tmux session doesn't exist,
+	// but the cold load fires before the tmux-exists check only if we've passed
+	// the tmuxSession nil check. Instead, verify readHookStatusFile directly.
+	hs := readHookStatusFile(inst.ID)
+	if hs == nil {
+		t.Fatal("readHookStatusFile returned nil, expected hook status from disk")
+	}
+	if hs.Status != "waiting" {
+		t.Errorf("hook status = %q, want waiting", hs.Status)
+	}
+	if hs.SessionID != "cold-sess-1" {
+		t.Errorf("hook session ID = %q, want cold-sess-1", hs.SessionID)
 	}
 }
 
-func TestCurrentComposerPrompt_UsesBottomComposerBlock(t *testing.T) {
-	content := strings.Join([]string{
-		"> quoted output line from earlier response",
-		"Some other output",
-		"────────────────",
-		"❯\u00a0Read these 3 files and produce a summary for DIAGTOKEN_123. Keep",
-		"  under 80 lines and include one verdict line.",
-		"────────────────",
-		"[Opus 4.6] Context: 0%",
-	}, "\n")
+// TestUpdateStatus_ColdLoadResetsAcknowledged verifies that cold-loading a
+// "waiting" hook status resets the stale acknowledged flag from ReconnectSessionLazy.
+func TestUpdateStatus_ColdLoadResetsAcknowledged(t *testing.T) {
+	skipIfNoTmuxServer(t)
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
 
-	got, ok := currentComposerPrompt(content)
-	if !ok {
-		t.Fatal("expected current composer prompt to be found")
+	inst := NewInstanceWithTool("cold-ack-test", tmpHome, "claude")
+
+	// Create a real tmux session so UpdateStatus gets past the Exists() check
+	if err := inst.tmuxSession.Start("sleep 3600"); err != nil {
+		t.Fatalf("failed to start tmux session: %v", err)
 	}
-	want := "Read these 3 files and produce a summary for DIAGTOKEN_123. Keep under 80 lines and include one verdict line."
-	if got != want {
-		t.Fatalf("unexpected composer prompt.\nwant: %q\ngot:  %q", want, got)
+	defer func() { _ = inst.tmuxSession.Kill() }()
+
+	// Simulate what ReconnectSessionLazy does for previousStatus="idle"
+	inst.tmuxSession.Acknowledge()
+	if !inst.tmuxSession.IsAcknowledged() {
+		t.Fatal("precondition: acknowledged should be true after Acknowledge()")
+	}
+
+	// Write a hook status file showing "waiting"
+	hooksDir := GetHooksDir()
+	if err := os.MkdirAll(hooksDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	hookData := fmt.Sprintf(`{"status":"waiting","session_id":"sess-1","event":"Stop","ts":%d}`, time.Now().Unix())
+	if err := os.WriteFile(filepath.Join(hooksDir, inst.ID+".json"), []byte(hookData), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for grace period to pass (1.5s)
+	time.Sleep(2 * time.Second)
+
+	// hookStatus is empty, so cold load should fire and reset acknowledged
+	inst.hookStatus = ""
+	_ = inst.UpdateStatus()
+
+	// After cold load with "waiting" status, acknowledged should be reset
+	if inst.tmuxSession.IsAcknowledged() {
+		t.Error("acknowledged should be false after cold-loading 'waiting' hook status")
+	}
+}
+
+// TestWriteHookSessionAnchor_InRestart verifies that WriteHookSessionAnchor
+// creates a .sid file with the correct session ID content.
+func TestWriteHookSessionAnchor_InRestart(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	instanceID := "restart-sid-test"
+	sessionID := "restart-session-abc123"
+
+	WriteHookSessionAnchor(instanceID, sessionID)
+
+	got := ReadHookSessionAnchor(instanceID)
+	if got != sessionID {
+		t.Errorf("ReadHookSessionAnchor = %q, want %q", got, sessionID)
+	}
+}
+
+// Tests for hasUnsentComposerPrompt and currentComposerPrompt moved to
+// internal/send/send_test.go as part of send verification consolidation.
+
+// TestGenerateUUID verifies that generateUUID returns a valid lowercase UUID v4.
+func TestGenerateUUID(t *testing.T) {
+	uuidRE := regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+	id := generateUUID()
+	if !uuidRE.MatchString(id) {
+		t.Errorf("generateUUID() = %q, does not match UUID v4 pattern", id)
+	}
+	// Must be all lowercase
+	if id != strings.ToLower(id) {
+		t.Errorf("generateUUID() = %q, must be lowercase", id)
+	}
+}
+
+// TestGenerateUUID_Uniqueness verifies that two calls return different values.
+func TestGenerateUUID_Uniqueness(t *testing.T) {
+	a := generateUUID()
+	b := generateUUID()
+	if a == b {
+		t.Errorf("generateUUID() returned same value twice: %q", a)
+	}
+}
+
+// TestBuildClaudeCommandNoUuidgen verifies that the built command does not use
+// shell-based uuidgen or $( substitution for the session ID.
+func TestBuildClaudeCommandNoUuidgen(t *testing.T) {
+	inst := NewInstanceWithTool("uuid-test", "/tmp/test", "claude")
+	cmd := inst.buildClaudeCommand("claude")
+
+	if strings.Contains(cmd, "uuidgen") {
+		t.Errorf("command must NOT use shell uuidgen (replaced with Go-side UUID):\n  cmd: %q", cmd)
+	}
+	if strings.Contains(cmd, "session_id=$(") {
+		t.Errorf("command must NOT use $( shell substitution for session ID:\n  cmd: %q", cmd)
+	}
+}
+
+// TestBuildClaudeCommandHasSessionID verifies that the built command embeds a
+// literal UUID in the --session-id flag. CLAUDE_SESSION_ID is set via host-side
+// SetEnvironment after session start (not embedded in the shell command string).
+func TestBuildClaudeCommandHasSessionID(t *testing.T) {
+	inst := NewInstanceWithTool("uuid-literal-test", "/tmp/test", "claude")
+	cmd := inst.buildClaudeCommand("claude")
+
+	if !strings.Contains(cmd, "--session-id") {
+		t.Errorf("command must include --session-id flag:\n  cmd: %q", cmd)
+	}
+	// tmux set-environment must NOT be in the shell command string;
+	// CLAUDE_SESSION_ID is propagated via host-side SetEnvironment after tmux start.
+	if strings.Contains(cmd, "tmux set-environment CLAUDE_SESSION_ID") {
+		t.Errorf("command must NOT embed tmux set-environment (use host-side SetEnvironment):\n  cmd: %q", cmd)
+	}
+}
+
+// TestForkCommandNoUuidgen verifies that Fork() does not use shell uuidgen.
+func TestForkCommandNoUuidgen(t *testing.T) {
+	inst := NewInstance("fork-uuid-test", "/tmp/test")
+	inst.ClaudeSessionID = "parent-session-id"
+	inst.ClaudeDetectedAt = time.Now()
+
+	cmd, err := inst.Fork("forked", "")
+	if err != nil {
+		t.Fatalf("Fork() failed: %v", err)
+	}
+
+	if strings.Contains(cmd, "uuidgen") {
+		t.Errorf("Fork command must NOT use shell uuidgen (replaced with Go-side UUID):\n  cmd: %q", cmd)
+	}
+	if strings.Contains(cmd, "session_id=$(") {
+		t.Errorf("Fork command must NOT use $( shell substitution:\n  cmd: %q", cmd)
 	}
 }

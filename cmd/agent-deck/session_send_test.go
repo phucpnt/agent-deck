@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/asheshgoplani/agent-deck/internal/session"
+	"github.com/asheshgoplani/agent-deck/internal/tmux"
 )
 
 // mockStatusChecker implements statusChecker for testing waitForCompletion.
@@ -98,6 +100,45 @@ func TestWaitForCompletion_TransientErrors(t *testing.T) {
 	}
 }
 
+func TestWaitForCompletion_SessionDeath(t *testing.T) {
+	// When GetStatus returns 5+ consecutive errors, the session is dead.
+	// waitForCompletion should return ("error", nil) instead of hanging.
+	mock := &mockStatusChecker{
+		statuses: []string{"", "", "", "", "", "", ""},
+		errors: []error{
+			fmt.Errorf("tmux session not found"),
+			fmt.Errorf("tmux session not found"),
+			fmt.Errorf("tmux session not found"),
+			fmt.Errorf("tmux session not found"),
+			fmt.Errorf("tmux session not found"),
+			fmt.Errorf("tmux session not found"),
+			fmt.Errorf("tmux session not found"),
+		},
+	}
+	status, err := waitForCompletion(mock, 10*time.Second)
+	if err != nil {
+		t.Fatalf("expected nil error (session death detection), got: %v", err)
+	}
+	if status != "error" {
+		t.Errorf("expected status 'error' for session death, got %q", status)
+	}
+}
+
+func TestWaitForCompletion_TransientRecovery(t *testing.T) {
+	// Fewer than 5 consecutive errors should recover when a valid status follows.
+	mock := &mockStatusChecker{
+		statuses: []string{"", "", "", "waiting"},
+		errors:   []error{fmt.Errorf("tmux error"), fmt.Errorf("tmux error"), fmt.Errorf("tmux error"), nil},
+	}
+	status, err := waitForCompletion(mock, 30*time.Second)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if status != "waiting" {
+		t.Errorf("expected status 'waiting' after transient recovery, got %q", status)
+	}
+}
+
 func TestWaitForCompletion_Timeout(t *testing.T) {
 	mock := &mockStatusChecker{
 		statuses: []string{"active"}, // Stays active forever
@@ -121,6 +162,7 @@ type mockSendRetryTarget struct {
 
 	sendKeysCalls  int32
 	sendEnterCalls int32
+	sendCtrlCCalls int32
 }
 
 func (m *mockSendRetryTarget) SendKeysAndEnter(_ string) error {
@@ -148,6 +190,11 @@ func (m *mockSendRetryTarget) SendEnter() error {
 	return nil
 }
 
+func (m *mockSendRetryTarget) SendCtrlC() error {
+	atomic.AddInt32(&m.sendCtrlCCalls, 1)
+	return nil
+}
+
 func (m *mockSendRetryTarget) CapturePaneFresh() (string, error) {
 	i := int(m.paneIdx.Add(1) - 1)
 	if len(m.panes) == 0 {
@@ -161,66 +208,6 @@ func (m *mockSendRetryTarget) CapturePaneFresh() (string, error) {
 		err = m.paneErrs[i]
 	}
 	return m.panes[i], err
-}
-
-func TestHasUnsentPastedPrompt(t *testing.T) {
-	if !hasUnsentPastedPrompt("❯ [Pasted text #1 +89 lines]") {
-		t.Fatal("expected pasted prompt marker to be detected")
-	}
-	if hasUnsentPastedPrompt("normal terminal output") {
-		t.Fatal("did not expect normal output to be detected as pasted prompt")
-	}
-}
-
-func TestHasUnsentComposerPrompt(t *testing.T) {
-	content := "────────────────\n❯\u00a0Write one line: LAUNCH_OK\n[Opus 4.6] Context: 0%"
-	if !hasUnsentComposerPrompt(content, "Write one line: LAUNCH_OK") {
-		t.Fatal("expected unsent composer prompt to be detected")
-	}
-	if hasUnsentComposerPrompt(content, "Different text") {
-		t.Fatal("did not expect mismatched composer text to be detected")
-	}
-
-	// Submitted messages can appear in history; only current composer should count.
-	submitted := "❯ Write one line: LAUNCH_OK\n✳ Tempering…\n────────────────\n❯\n────────────────\n[Opus 4.6] Context: 0%"
-	if hasUnsentComposerPrompt(submitted, "Write one line: LAUNCH_OK") {
-		t.Fatal("did not expect submitted history line to be treated as unsent composer input")
-	}
-
-	// Wrapped current composer lines only expose a prefix of the message.
-	wrappedContent := "────────────────\n❯\u00a0Read these 3 files and produce a summary for DIAGTOKEN_123. Keep\n  under 80 lines and include one verdict line.\n────────────────\n[Opus 4.6] Context: 0%"
-	wrappedMessage := "Read these 3 files and produce a summary for DIAGTOKEN_123. Keep under 80 lines and include one verdict line."
-	if !hasUnsentComposerPrompt(wrappedContent, wrappedMessage) {
-		t.Fatal("expected wrapped unsent composer prompt to be detected")
-	}
-
-	// Claude hint suggestions should not be treated as unsent input for a
-	// different message.
-	suggestion := "────────────────\n❯\u00a0Try \"write a test for <filepath>\"\n────────────────\n[Opus 4.6] Context: 0%"
-	if hasUnsentComposerPrompt(suggestion, wrappedMessage) {
-		t.Fatal("did not expect suggestion placeholder to be treated as unsent composer input")
-	}
-}
-
-func TestCurrentComposerPrompt_UsesBottomComposerBlock(t *testing.T) {
-	content := strings.Join([]string{
-		"> quoted output line from earlier response",
-		"Some other output",
-		"────────────────",
-		"❯\u00a0Read these 3 files and produce a summary for DIAGTOKEN_123. Keep",
-		"  under 80 lines and include one verdict line.",
-		"────────────────",
-		"[Opus 4.6] Context: 0%",
-	}, "\n")
-
-	got, ok := currentComposerPrompt(content)
-	if !ok {
-		t.Fatal("expected current composer prompt to be found")
-	}
-	want := "Read these 3 files and produce a summary for DIAGTOKEN_123. Keep under 80 lines and include one verdict line."
-	if got != want {
-		t.Fatalf("unexpected composer prompt.\nwant: %q\ngot:  %q", want, got)
-	}
 }
 
 func TestSendWithRetryTarget_SkipVerify(t *testing.T) {
@@ -260,8 +247,9 @@ func TestSendWithRetryTarget_WaitingWithoutPasteMarkerReturnsSuccess(t *testing.
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if got := atomic.LoadInt32(&mock.sendEnterCalls); got != 1 {
-		t.Fatalf("expected 1 periodic fallback SendEnter call for waiting-without-active state, got %d", got)
+	// With aggressive early retry (retry < 5), all 4 iterations nudge Enter.
+	if got := atomic.LoadInt32(&mock.sendEnterCalls); got != 4 {
+		t.Fatalf("expected 4 aggressive early SendEnter calls for waiting-without-active state, got %d", got)
 	}
 }
 
@@ -298,8 +286,10 @@ func TestSendWithRetryTarget_DetectsPasteMarkerAfterInitialWaiting(t *testing.T)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if got := atomic.LoadInt32(&mock.sendEnterCalls); got != 1 {
-		t.Fatalf("expected 1 SendEnter call when pasted marker appears after initial waiting, got %d", got)
+	// 2 calls: retry 0 fires early aggressive nudge (waiting, no active seen),
+	// retry 1 fires from paste marker detection.
+	if got := atomic.LoadInt32(&mock.sendEnterCalls); got != 2 {
+		t.Fatalf("expected 2 SendEnter calls (1 early nudge + 1 paste marker), got %d", got)
 	}
 }
 
@@ -347,8 +337,9 @@ func TestSendWithRetryTarget_AmbiguousStateUsesLimitedFallbackRetries(t *testing
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if got := atomic.LoadInt32(&mock.sendEnterCalls); got != 2 {
-		t.Fatalf("expected 2 limited fallback SendEnter calls, got %d", got)
+	// Ambiguous-state Enter budget increased from 2 to 4; all 4 retries send Enter.
+	if got := atomic.LoadInt32(&mock.sendEnterCalls); got != 4 {
+		t.Fatalf("expected 4 fallback SendEnter calls (increased budget), got %d", got)
 	}
 }
 
@@ -364,6 +355,206 @@ func TestSendWithRetryTarget_ReturnsErrorWhenInitialSendFails(t *testing.T) {
 		t.Fatalf("unexpected error message: %v", err)
 	}
 }
+
+func TestSendWithRetryTarget_AggressiveEarlyEnterNudge(t *testing.T) {
+	// Verify that SendEnter is called on every iteration for the first 5
+	// retries when in waiting-without-active state, then every 2nd iteration.
+	mock := &mockSendRetryTarget{
+		statuses: []string{
+			"waiting", "waiting", "waiting", "waiting", "waiting", // retries 0-4: all nudge
+			"waiting", "waiting", "waiting", "waiting", "waiting", // retries 5-9: even nudge
+		},
+		panes: []string{"", "", "", "", "", "", "", "", "", ""},
+	}
+	err := sendWithRetryTarget(mock, "hello", false, sendRetryOptions{maxRetries: 10, checkDelay: 0})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// First 5 retries (0-4): all nudge = 5 calls
+	// Retries 5-9: retry%2==0 means retries 6, 8 nudge = 2 calls
+	// Total: 5 + 2 = 7
+	// But wait: retry 5 is not < 5 and 5%2 != 0, so no nudge.
+	// retry 6: 6%2 == 0, nudge. retry 7: no. retry 8: nudge. retry 9: no.
+	// Total: 5 (early) + 2 (even from 5-9) = 7
+	if got := atomic.LoadInt32(&mock.sendEnterCalls); got != 7 {
+		t.Fatalf("expected 7 SendEnter calls (5 early + 2 even), got %d", got)
+	}
+}
+
+func TestSendWithRetryTarget_IncreasedAmbiguousBudget(t *testing.T) {
+	// Verify that ambiguous-state Enter budget is 4 (up from 2).
+	mock := &mockSendRetryTarget{
+		statuses: []string{"error", "error", "error", "error", "error"},
+		panes:    []string{"", "", "", "", ""},
+	}
+	err := sendWithRetryTarget(mock, "hello", false, sendRetryOptions{maxRetries: 5, checkDelay: 0})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// Retries 0, 1, 2, 3 are < 4 so SendEnter is called 4 times; retry 4 is not.
+	if got := atomic.LoadInt32(&mock.sendEnterCalls); got != 4 {
+		t.Fatalf("expected 4 SendEnter calls for increased ambiguous budget, got %d", got)
+	}
+}
+
+func TestSendWithRetryTarget_FullResendAfterMessageLost(t *testing.T) {
+	// Simulate the TUI init race: agent reports "waiting" but never transitions
+	// to "active" because the message was lost during init. After
+	// fullResendThreshold (8) consecutive waiting checks with no activity,
+	// sendWithRetryTarget should Ctrl+C and re-send the full message.
+	// After re-send, the agent transitions to "active".
+	statuses := make([]string, 12)
+	panes := make([]string, 12)
+	for i := range statuses {
+		statuses[i] = "waiting"
+		panes[i] = ""
+	}
+	// After the full resend (at check ~9), agent becomes active
+	statuses[10] = "active"
+	statuses[11] = "active"
+
+	mock := &mockSendRetryTarget{
+		statuses: statuses,
+		panes:    panes,
+	}
+	err := sendWithRetryTarget(mock, "hello", false, sendRetryOptions{maxRetries: 12, checkDelay: 0})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := atomic.LoadInt32(&mock.sendCtrlCCalls); got != 1 {
+		t.Fatalf("expected 1 SendCtrlC call for full resend, got %d", got)
+	}
+	// sendKeysCalls: 1 initial + 1 resend = 2
+	if got := atomic.LoadInt32(&mock.sendKeysCalls); got != 2 {
+		t.Fatalf("expected 2 SendKeysAndEnter calls (initial + resend), got %d", got)
+	}
+}
+
+func TestSendWithRetryTarget_FullResendMaxLimit(t *testing.T) {
+	// Verify that full resends are capped at maxFullResends (3).
+	// With fullResendThreshold=8, we need at least 8*4=32 retries
+	// to trigger all 3 resends plus some trailing checks.
+	n := 40
+	statuses := make([]string, n)
+	panes := make([]string, n)
+	for i := range statuses {
+		statuses[i] = "waiting"
+		panes[i] = ""
+	}
+	mock := &mockSendRetryTarget{
+		statuses: statuses,
+		panes:    panes,
+	}
+	err := sendWithRetryTarget(mock, "hello", false, sendRetryOptions{maxRetries: n, checkDelay: 0})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// Should have exactly 3 full resends (the cap)
+	if got := atomic.LoadInt32(&mock.sendCtrlCCalls); got != 3 {
+		t.Fatalf("expected 3 SendCtrlC calls (max resends), got %d", got)
+	}
+	// 1 initial + 3 resends = 4
+	if got := atomic.LoadInt32(&mock.sendKeysCalls); got != 4 {
+		t.Fatalf("expected 4 SendKeysAndEnter calls (initial + 3 resends), got %d", got)
+	}
+}
+
+// skipIfNoTmuxServer skips the test if tmux is not available or not running.
+func skipIfNoTmuxServer(t *testing.T) {
+	t.Helper()
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux not available")
+	}
+	if err := exec.Command("tmux", "list-sessions").Run(); err != nil {
+		t.Skip("tmux server not running")
+	}
+}
+
+// TestSendWithRetry_DelayedInputHandler_Integration reproduces the bug where
+// session send reports success but the message is silently dropped.
+//
+// The bug scenario: Claude Code renders the ❯ prompt (causing GetStatus to
+// report "waiting") before its Ink-based TUI input handler is ready to accept
+// keystrokes. waitForAgentReady returns, sendWithRetry sends keys, but the TUI
+// discards them because it hasn't finished initializing.
+//
+// This test simulates that race by running a script that:
+// 1. Immediately prints a ❯ prompt (so status detection sees "waiting")
+// 2. Sleeps before starting to read input (simulating TUI init delay)
+// 3. After the delay, reads a line and echoes it with a marker
+func TestSendWithRetry_DelayedInputHandler_Integration(t *testing.T) {
+	skipIfNoTmuxServer(t)
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	if os.Getenv("AGENT_DECK_INTEGRATION_TESTS") == "" {
+		t.Skip("skipping flaky tmux integration test (set AGENT_DECK_INTEGRATION_TESTS=1 to enable)")
+	}
+
+	sess := tmux.NewSession("send-test-delayed", "/tmp")
+
+	// Script that simulates Claude's startup race condition.
+	// Traps SIGINT so Ctrl+C doesn't kill it (like real Claude TUI).
+	// The inner loop discards empty lines (simulating how Claude's Ink TUI
+	// ignores empty Enter presses) and only accepts non-empty input.
+	script := `bash -c '
+		trap "" INT   # Ignore Ctrl+C (like Claude Ink TUI)
+
+		# Phase 1: Show prompt before input handler is ready
+		printf "❯ "
+
+		# Phase 2: TUI init delay — drain all input that arrives
+		sleep 2
+		while read -t 0.1 -r _discard 2>/dev/null; do :; done
+
+		# Phase 3: TUI ready — show fresh prompt, accept non-empty input only
+		# (Claude ignores empty Enter presses at the prompt)
+		while true; do
+			printf "\n❯ "
+			read -r line
+			if [ -n "$line" ]; then
+				echo "GOT: $line"
+				break
+			fi
+		done
+		sleep 2
+	'`
+
+	if err := sess.Start(script); err != nil {
+		t.Fatalf("Failed to start session: %v", err)
+	}
+	defer func() { _ = sess.Kill() }()
+
+	// Wait for the ❯ prompt to appear (simulates what waitForAgentReady sees)
+	time.Sleep(500 * time.Millisecond)
+
+	message := "DELAYED_HANDLER_TEST_MSG"
+	err := sendWithRetry(sess, message, false)
+	if err != nil {
+		t.Fatalf("sendWithRetry failed: %v", err)
+	}
+
+	// Wait for the script to process the re-sent message
+	time.Sleep(3 * time.Second)
+
+	content, err := sess.CapturePane()
+	if err != nil {
+		t.Fatalf("CapturePane failed: %v", err)
+	}
+
+	t.Logf("Pane content after send:\n%s", content)
+
+	if !strings.Contains(content, "GOT: "+message) {
+		t.Errorf("Message was sent but never delivered to the input handler.\n"+
+			"sendWithRetry reported success but the message was lost during the TUI init window.\n"+
+			"Pane content:\n%s", content)
+	}
+}
+
+// Integration test coverage for Codex readiness: waitForAgentReady uses a
+// concrete *tmux.Session so it cannot be unit tested with mocks here.
+// See TestSend_CodexReadiness in internal/integration/send_reliability_test.go
+// (Plan 02) for integration test coverage of Codex prompt gating.
 
 // TestWaitOutputRetrieval_StaleSessionID verifies that --wait correctly
 // retrieves output even when the initially-loaded ClaudeSessionID is stale.

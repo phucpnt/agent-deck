@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -20,6 +21,7 @@ import (
 	"github.com/muesli/termenv"
 	"golang.org/x/term"
 
+	"github.com/asheshgoplani/agent-deck/internal/costs"
 	"github.com/asheshgoplani/agent-deck/internal/git"
 	"github.com/asheshgoplani/agent-deck/internal/logging"
 	"github.com/asheshgoplani/agent-deck/internal/session"
@@ -29,7 +31,7 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/web"
 )
 
-const Version = "0.19.19"
+const Version = "0.26.4"
 
 // Table column widths for list command output
 const (
@@ -250,8 +252,17 @@ func main() {
 		case "conductor":
 			handleConductor(profile, args[1:])
 			return
+		case "openclaw", "oc":
+			handleOpenClaw(profile, args[1:])
+			return
+		case "remote":
+			handleRemote(profile, args[1:])
+			return
 		case "worktree", "wt":
 			handleWorktree(profile, args[1:])
+			return
+		case "costs":
+			handleCosts(profile, args[1:])
 			return
 		case "web":
 			webEnabled = true
@@ -272,8 +283,14 @@ func main() {
 		case "codex-hooks":
 			handleCodexHooks(args[1:])
 			return
+		case "gemini-hooks":
+			handleGeminiHooks(args[1:])
+			return
 		case "notify-daemon":
 			handleNotifyDaemon(args[1:])
+			return
+		case "debug-dump":
+			handleDebugDump()
 			return
 		}
 	}
@@ -427,6 +444,96 @@ func main() {
 	// Start TUI with the specified profile
 	homeModel := ui.NewHomeWithProfileAndMode(profile)
 
+	// ═══════════════════════════════════════════════════════════════════
+	// Cost Tracking Initialization
+	// ═══════════════════════════════════════════════════════════════════
+	var costStore *costs.Store
+	if db := statedb.GetGlobal(); db != nil {
+		costStore = costs.NewStore(db.DB())
+
+		// Load user config for pricing overrides and budgets
+		userCfg, _ := session.LoadUserConfig()
+
+		// Set up pricer with overrides
+		homeDir, _ := os.UserHomeDir()
+		cacheDir := filepath.Join(homeDir, ".agent-deck")
+		pricerCfg := costs.PricerConfig{CachePath: cacheDir}
+		if userCfg != nil && len(userCfg.Costs.Pricing.Overrides) > 0 {
+			pricerCfg.Overrides = make(map[string]costs.PriceOverride)
+			for model, ov := range userCfg.Costs.Pricing.Overrides {
+				pricerCfg.Overrides[model] = costs.PriceOverride{
+					InputPerMtok:      ov.InputPerMtok,
+					OutputPerMtok:     ov.OutputPerMtok,
+					CacheReadPerMtok:  ov.CacheReadPerMtok,
+					CacheWritePerMtok: ov.CacheWritePerMtok,
+				}
+			}
+		}
+		pricer := costs.NewPricer(pricerCfg)
+		_ = pricer.LoadCache()
+
+		// Start daily price fetcher
+		fetchCtx, fetchCancel := context.WithCancel(context.Background())
+		defer fetchCancel()
+		fetcher := &costs.Fetcher{CachePath: filepath.Join(cacheDir, "pricing.json"), Pricer: pricer}
+		go fetcher.StartDaily(fetchCtx)
+
+		// Set up budget checker
+		var budgetCfg costs.BudgetConfig
+		if userCfg != nil {
+			bc := userCfg.Costs.Budgets
+			budgetCfg.DailyLimit = int64(math.Round(bc.DailyLimit * 1_000_000))
+			budgetCfg.WeeklyLimit = int64(math.Round(bc.WeeklyLimit * 1_000_000))
+			budgetCfg.MonthlyLimit = int64(math.Round(bc.MonthlyLimit * 1_000_000))
+			if len(bc.Groups) > 0 {
+				budgetCfg.GroupLimits = make(map[string]int64)
+				for name, g := range bc.Groups {
+					budgetCfg.GroupLimits[name] = int64(math.Round(g.DailyLimit * 1_000_000))
+				}
+			}
+		}
+		budgetChecker := costs.NewBudgetChecker(budgetCfg, costStore)
+
+		// Wire into TUI
+		homeModel.SetCostStore(costStore)
+		homeModel.SetCostPricer(pricer)
+		homeModel.SetCostBudget(budgetChecker)
+
+		// Start cost event watcher (for Claude hook events)
+		costEventsDir := filepath.Join(homeDir, ".agent-deck", "cost-events")
+		costWatcher, watchErr := costs.NewCostEventWatcher(costEventsDir)
+		if watchErr == nil {
+			go costWatcher.Start()
+			defer costWatcher.Stop()
+
+			// Process incoming cost events from hooks
+			go func() {
+				for raw := range costWatcher.EventCh() {
+					ev := costs.CostEvent{
+						ID:               fmt.Sprintf("%s_%d", raw.InstanceID, raw.Timestamp),
+						SessionID:        raw.InstanceID,
+						Timestamp:        time.Unix(0, raw.Timestamp),
+						Model:            raw.Model,
+						InputTokens:      raw.InputTokens,
+						OutputTokens:     raw.OutputTokens,
+						CacheReadTokens:  raw.CacheReadTokens,
+						CacheWriteTokens: raw.CacheWriteTokens,
+						CostMicrodollars: pricer.ComputeCost(raw.Model, raw.InputTokens, raw.OutputTokens, raw.CacheReadTokens, raw.CacheWriteTokens),
+					}
+					_ = costStore.WriteCostEvent(ev)
+				}
+			}()
+		}
+
+		// Run retention cleanup on startup
+		if userCfg != nil {
+			retDays := userCfg.Costs.GetRetentionDays()
+			if retDays > 0 {
+				_, _ = costStore.PurgeOlderThan(retDays)
+			}
+		}
+	}
+
 	// Start web server alongside TUI if "web" subcommand was used
 	if webEnabled {
 		effectiveProfile := session.GetEffectiveProfile(profile)
@@ -438,6 +545,9 @@ func main() {
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: web server setup failed: %v\n", err)
 			os.Exit(1)
+		}
+		if costStore != nil {
+			server.SetCostStore(costStore)
 		}
 		go func() {
 			if err := server.Start(); err != nil {
@@ -452,6 +562,15 @@ func main() {
 			_ = server.Shutdown(ctx)
 		}()
 	}
+
+	// Disable the Kitty keyboard protocol before starting the TUI.
+	// Wayland terminals (Ghostty, Foot, Alacritty) send keys using CSI u
+	// encoding by default; Bubble Tea v1.3.10 does not parse those sequences,
+	// so uppercase shortcuts and uppercase text input are silently dropped.
+	// Pushing keyboard mode 0 (legacy) restores standard key reporting.
+	// Terminals that don't support the protocol ignore this sequence safely.
+	ui.DisableKittyKeyboard(os.Stdout)
+	defer ui.RestoreKittyKeyboard(os.Stdout)
 
 	p := tea.NewProgram(
 		homeModel,
@@ -529,6 +648,8 @@ func reorderArgsForFlagParsing(args []string) []string {
 		"--location":       true,
 		"--resume-session": true,
 		"--sandbox-image":  true,
+		"--ssh":            true,
+		"--remote-path":    true,
 	}
 
 	var flags []string
@@ -684,7 +805,7 @@ func handleAdd(profile string, args []string) {
 	)
 	parent := fs.String("parent", "", "Parent session (creates sub-session, inherits group)")
 	parentShort := fs.String("p", "", "Parent session (short)")
-	noParent := fs.Bool("no-parent", false, "Disable automatic parent linking")
+	noParent := fs.Bool("no-parent", false, "Disable automatic parent linking (use 'session set-parent' later to link manually)")
 	quickCreate := fs.Bool("quick", false, "Auto-generate session name (adjective-noun)")
 	quickCreateShort := fs.Bool("Q", false, "Auto-generate session name (short)")
 	jsonOutput := fs.Bool("json", false, "Output as JSON")
@@ -694,8 +815,8 @@ func handleAdd(profile string, args []string) {
 	// Worktree flags
 	worktreeBranch := fs.String("w", "", "Create session in git worktree for branch")
 	worktreeBranchLong := fs.String("worktree", "", "Create session in git worktree for branch")
-	newBranch := fs.Bool("b", false, "Create new branch (use with --worktree)")
-	newBranchLong := fs.Bool("new-branch", false, "Create new branch")
+	newBranch := fs.Bool("b", false, "Create new branch if needed (reuse existing branch when present)")
+	newBranchLong := fs.Bool("new-branch", false, "Create new branch if needed (reuse existing branch when present)")
 	worktreeLocation := fs.String("location", "", "Worktree location: sibling, subdirectory, or custom path")
 
 	// MCP flag - can be specified multiple times
@@ -709,8 +830,14 @@ func handleAdd(profile string, args []string) {
 	sandbox := fs.Bool("sandbox", false, "Run session in Docker sandbox")
 	sandboxImage := fs.String("sandbox-image", "", "Docker image for sandbox (overrides config default)")
 
+	// SSH remote flags
+	sshHost := fs.String("ssh", "", "SSH destination (e.g., user@host)")
+	sshRemotePath := fs.String("remote-path", "", "Remote working directory (used with --ssh)")
+
 	// Resume session flag
 	resumeSession := fs.String("resume-session", "", "Claude session ID to resume (skips new session creation)")
+	yoloMode := fs.Bool("yolo", false, "Enable YOLO mode for Gemini or Codex sessions")
+	geminiYoloMode := fs.Bool("gemini-yolo", false, "Enable YOLO mode (alias for --yolo)")
 
 	fs.Usage = func() {
 		fmt.Println("Usage: agent-deck add [path] [options]")
@@ -733,6 +860,8 @@ func handleAdd(profile string, args []string) {
 		fmt.Println("  agent-deck add -t \"Research\" -c claude --mcp memory --mcp sequential-thinking /tmp/x")
 		fmt.Println("  agent-deck add -c opencode --wrapper \"nvim +'terminal {command}' +'startinsert'\" .")
 		fmt.Println("  agent-deck add -c \"codex --dangerously-bypass-approvals-and-sandbox\" .")
+		fmt.Println("  agent-deck add -c gemini --yolo .")
+		fmt.Println("  agent-deck add -c claude -g work .   # -c is shorthand for --cmd")
 		fmt.Println("  agent-deck add -g ard --no-parent -c claude .")
 		fmt.Println("  agent-deck add --quick -c claude .   # Auto-generated name")
 		fmt.Println()
@@ -740,6 +869,10 @@ func handleAdd(profile string, args []string) {
 		fmt.Println("  agent-deck add -w feature/login .    # Create worktree for existing branch")
 		fmt.Println("  agent-deck add -w feature/new -b .   # Create worktree with new branch")
 		fmt.Println("  agent-deck add --worktree fix/bug-123 --new-branch /path/to/repo")
+		fmt.Println()
+		fmt.Println("SSH Examples:")
+		fmt.Println("  agent-deck add --ssh user@host --remote-path ~/project -c claude")
+		fmt.Println("  agent-deck add --ssh user@host -c claude -t \"remote-dev\"")
 	}
 
 	// Reorder args: move path to end so flags are parsed correctly
@@ -762,7 +895,7 @@ func handleAdd(profile string, args []string) {
 	if *worktreeBranchLong != "" {
 		wtBranch = *worktreeBranchLong
 	}
-	createNewBranch := *newBranch || *newBranchLong
+	_ = *newBranch || *newBranchLong
 
 	// Merge short and long flags
 	sessionTitle := mergeFlags(*title, *titleShort)
@@ -858,15 +991,26 @@ func handleAdd(profile string, args []string) {
 		}
 	}
 
-	// Verify path exists and is a directory
-	info, err := os.Stat(path)
-	if err != nil {
-		fmt.Printf("Error: path does not exist: %s\n", path)
-		os.Exit(1)
-	}
-	if !info.IsDir() {
-		fmt.Printf("Error: path is not a directory: %s\n", path)
-		os.Exit(1)
+	// Verify path exists and is a directory (skip for SSH remote sessions)
+	if *sshHost != "" {
+		// For SSH sessions, use CWD as local placeholder path (project lives on remote)
+		if path == "" {
+			path, err = os.Getwd()
+			if err != nil {
+				fmt.Printf("Error: failed to get current directory: %v\n", err)
+				os.Exit(1)
+			}
+		}
+	} else {
+		info, err := os.Stat(path)
+		if err != nil {
+			fmt.Printf("Error: path does not exist: %s\n", path)
+			os.Exit(1)
+		}
+		if !info.IsDir() {
+			fmt.Printf("Error: path is not a directory: %s\n", path)
+			os.Exit(1)
+		}
 	}
 
 	// Handle worktree creation
@@ -891,17 +1035,6 @@ func handleAdd(profile string, args []string) {
 			os.Exit(1)
 		}
 
-		// Check -b flag logic: if -b is passed, branch must NOT exist (user wants new branch)
-		branchExists := git.BranchExists(repoRoot, wtBranch)
-		if createNewBranch && branchExists {
-			fmt.Fprintf(
-				os.Stderr,
-				"Error: branch '%s' already exists (remove -b flag to use existing branch)\n",
-				wtBranch,
-			)
-			os.Exit(1)
-		}
-
 		// Determine worktree location: CLI flag overrides config
 		wtSettings := session.GetWorktreeSettings()
 		location := wtSettings.DefaultLocation
@@ -918,25 +1051,31 @@ func handleAdd(profile string, args []string) {
 			Template:  wtSettings.Template(),
 		})
 
-		// Ensure parent directory exists (needed for subdirectory mode)
-		if err := os.MkdirAll(filepath.Dir(worktreePath), 0o755); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: failed to create parent directory: %v\n", err)
-			os.Exit(1)
-		}
-
-		// Create worktree atomically (git handles existence checks).
-		// This avoids a TOCTOU race from separate check-then-create steps.
-		if err := git.CreateWorktree(repoRoot, worktreePath, wtBranch); err != nil {
-			if isWorktreeAlreadyExistsError(err) {
-				fmt.Fprintf(os.Stderr, "Error: worktree already exists at %s\n", worktreePath)
-				fmt.Fprintf(os.Stderr, "Tip: Use 'agent-deck add %s' to add the existing worktree\n", worktreePath)
+		// Check for an existing worktree for this branch before creating a new one
+		if existingPath, err := git.GetWorktreeForBranch(repoRoot, wtBranch); err == nil && existingPath != "" {
+			fmt.Fprintf(os.Stderr, "Reusing existing worktree at %s for branch %s\n", existingPath, wtBranch)
+			worktreePath = existingPath
+		} else {
+			// Ensure parent directory exists (needed for subdirectory mode)
+			if err := os.MkdirAll(filepath.Dir(worktreePath), 0o755); err != nil {
+				fmt.Fprintf(os.Stderr, "Error: failed to create parent directory: %v\n", err)
 				os.Exit(1)
 			}
-			fmt.Fprintf(os.Stderr, "Error: failed to create worktree: %v\n", err)
-			os.Exit(1)
-		}
 
-		fmt.Printf("Created worktree at: %s\n", worktreePath)
+			// Create worktree atomically (git handles existence checks).
+			// This avoids a TOCTOU race from separate check-then-create steps.
+			if err := git.CreateWorktree(repoRoot, worktreePath, wtBranch); err != nil {
+				if isWorktreeAlreadyExistsError(err) {
+					fmt.Fprintf(os.Stderr, "Error: worktree already exists at %s\n", worktreePath)
+					fmt.Fprintf(os.Stderr, "Tip: Use 'agent-deck add %s' to add the existing worktree\n", worktreePath)
+					os.Exit(1)
+				}
+				fmt.Fprintf(os.Stderr, "Error: failed to create worktree: %v\n", err)
+				os.Exit(1)
+			}
+
+			fmt.Printf("Created worktree at: %s\n", worktreePath)
+		}
 		worktreeRepoRoot = repoRoot
 		// Update path to point to worktree so session uses worktree as working directory
 		path = worktreePath
@@ -1001,6 +1140,16 @@ func handleAdd(profile string, args []string) {
 		newInstance.Sandbox = session.NewSandboxConfig(*sandboxImage)
 	}
 
+	// Apply SSH remote config if requested.
+	if *sshHost != "" {
+		if *sandbox {
+			fmt.Println("Error: --ssh and --sandbox cannot be used together")
+			os.Exit(1)
+		}
+		newInstance.SSHHost = *sshHost
+		newInstance.SSHRemotePath = *sshRemotePath
+	}
+
 	// Handle --resume-session: set Claude session ID and resume mode
 	if *resumeSession != "" {
 		newInstance.ClaudeSessionID = *resumeSession
@@ -1016,6 +1165,11 @@ func handleAdd(profile string, args []string) {
 		if err := newInstance.SetClaudeOptions(opts); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: failed to set resume options: %v\n", err)
 		}
+	}
+
+	if err := applyCLIYoloOverride(newInstance, *yoloMode || *geminiYoloMode); err != nil {
+		fmt.Printf("Error: %v\n", err)
+		os.Exit(1)
 	}
 
 	// Add to instances
@@ -1083,6 +1237,12 @@ func handleAdd(profile string, args []string) {
 	if worktreePath != "" {
 		humanLines = append(humanLines, fmt.Sprintf("  Worktree: %s (branch: %s)", worktreePath, wtBranch))
 		humanLines = append(humanLines, fmt.Sprintf("  Repo:    %s", worktreeRepoRoot))
+	}
+	if *sshHost != "" {
+		humanLines = append(humanLines, fmt.Sprintf("  SSH:     %s", *sshHost))
+		if *sshRemotePath != "" {
+			humanLines = append(humanLines, fmt.Sprintf("  Remote:  %s", *sshRemotePath))
+		}
 	}
 	if *resumeSession != "" {
 		humanLines = append(humanLines, fmt.Sprintf("  Resume:  %s", *resumeSession))
@@ -1195,29 +1355,33 @@ func handleList(profile string, args []string) {
 	if *jsonOutput {
 		// JSON output for scripting
 		type sessionJSON struct {
-			ID        string    `json:"id"`
-			Title     string    `json:"title"`
-			Path      string    `json:"path"`
-			Group     string    `json:"group"`
-			Tool      string    `json:"tool"`
-			Command   string    `json:"command,omitempty"`
-			Status    string    `json:"status"`
-			Profile   string    `json:"profile"`
-			CreatedAt time.Time `json:"created_at"`
+			ID            string    `json:"id"`
+			Title         string    `json:"title"`
+			Path          string    `json:"path"`
+			Group         string    `json:"group"`
+			Tool          string    `json:"tool"`
+			Command       string    `json:"command,omitempty"`
+			Status        string    `json:"status"`
+			Profile       string    `json:"profile"`
+			CreatedAt     time.Time `json:"created_at"`
+			SSHHost       string    `json:"ssh_host,omitempty"`
+			SSHRemotePath string    `json:"ssh_remote_path,omitempty"`
 		}
 		sessions := make([]sessionJSON, len(instances))
 		for i, inst := range instances {
 			_ = inst.UpdateStatus()
 			sessions[i] = sessionJSON{
-				ID:        inst.ID,
-				Title:     inst.Title,
-				Path:      inst.ProjectPath,
-				Group:     inst.GroupPath,
-				Tool:      inst.Tool,
-				Command:   inst.Command,
-				Status:    StatusString(inst.Status),
-				Profile:   storage.Profile(),
-				CreatedAt: inst.CreatedAt,
+				ID:            inst.ID,
+				Title:         inst.Title,
+				Path:          inst.ProjectPath,
+				Group:         inst.GroupPath,
+				Tool:          inst.Tool,
+				Command:       inst.Command,
+				Status:        StatusString(inst.Status),
+				Profile:       storage.Profile(),
+				CreatedAt:     inst.CreatedAt,
+				SSHHost:       inst.SSHHost,
+				SSHRemotePath: inst.SSHRemotePath,
 			}
 		}
 		output, err := json.MarshalIndent(sessions, "", "  ")
@@ -1265,14 +1429,16 @@ func handleListAllProfiles(jsonOutput bool) {
 
 	if jsonOutput {
 		type sessionJSON struct {
-			ID        string    `json:"id"`
-			Title     string    `json:"title"`
-			Path      string    `json:"path"`
-			Group     string    `json:"group"`
-			Tool      string    `json:"tool"`
-			Command   string    `json:"command,omitempty"`
-			Profile   string    `json:"profile"`
-			CreatedAt time.Time `json:"created_at"`
+			ID            string    `json:"id"`
+			Title         string    `json:"title"`
+			Path          string    `json:"path"`
+			Group         string    `json:"group"`
+			Tool          string    `json:"tool"`
+			Command       string    `json:"command,omitempty"`
+			Profile       string    `json:"profile"`
+			CreatedAt     time.Time `json:"created_at"`
+			SSHHost       string    `json:"ssh_host,omitempty"`
+			SSHRemotePath string    `json:"ssh_remote_path,omitempty"`
 		}
 		var allSessions []sessionJSON
 
@@ -1287,14 +1453,16 @@ func handleListAllProfiles(jsonOutput bool) {
 			}
 			for _, inst := range instances {
 				allSessions = append(allSessions, sessionJSON{
-					ID:        inst.ID,
-					Title:     inst.Title,
-					Path:      inst.ProjectPath,
-					Group:     inst.GroupPath,
-					Tool:      inst.Tool,
-					Command:   inst.Command,
-					Profile:   profileName,
-					CreatedAt: inst.CreatedAt,
+					ID:            inst.ID,
+					Title:         inst.Title,
+					Path:          inst.ProjectPath,
+					Group:         inst.GroupPath,
+					Tool:          inst.Tool,
+					Command:       inst.Command,
+					Profile:       profileName,
+					CreatedAt:     inst.CreatedAt,
+					SSHHost:       inst.SSHHost,
+					SSHRemotePath: inst.SSHRemotePath,
 				})
 			}
 		}
@@ -1544,6 +1712,7 @@ type statusCounts struct {
 	waiting int
 	idle    int
 	err     int
+	stopped int
 	total   int
 }
 
@@ -1561,6 +1730,8 @@ func countByStatus(instances []*session.Instance) statusCounts {
 			counts.idle++
 		case session.StatusError:
 			counts.err++
+		case session.StatusStopped:
+			counts.stopped++
 		}
 		counts.total++
 	}
@@ -1610,7 +1781,7 @@ func handleStatus(profile string, args []string) {
 
 	if len(instances) == 0 {
 		if *jsonOutput {
-			fmt.Println(`{"waiting": 0, "running": 0, "idle": 0, "error": 0, "total": 0}`)
+			fmt.Println(`{"waiting": 0, "running": 0, "idle": 0, "error": 0, "stopped": 0, "total": 0}`)
 		} else if *quiet || *quietShort {
 			fmt.Println("0")
 		} else {
@@ -1629,6 +1800,7 @@ func handleStatus(profile string, args []string) {
 			Running int `json:"running"`
 			Idle    int `json:"idle"`
 			Error   int `json:"error"`
+			Stopped int `json:"stopped"`
 			Total   int `json:"total"`
 		}
 		output, _ := json.Marshal(statusJSON{
@@ -1636,6 +1808,7 @@ func handleStatus(profile string, args []string) {
 			Running: counts.running,
 			Idle:    counts.idle,
 			Error:   counts.err,
+			Stopped: counts.stopped,
 			Total:   counts.total,
 		})
 		fmt.Println(string(output))
@@ -1668,6 +1841,7 @@ func handleStatus(profile string, args []string) {
 		printStatusGroup("WAITING", "◐", session.StatusWaiting)
 		printStatusGroup("RUNNING", "●", session.StatusRunning)
 		printStatusGroup("IDLE", "○", session.StatusIdle)
+		printStatusGroup("STOPPED", "■", session.StatusStopped)
 		printStatusGroup("ERROR", "✕", session.StatusError)
 
 		fmt.Printf("Total: %d sessions in profile '%s'\n", counts.total, storage.Profile())
@@ -2000,6 +2174,9 @@ func handleUpdate(args []string) {
 
 	fmt.Printf("\n✓ Updated to v%s\n", info.LatestVersion)
 	fmt.Println("  Restart agent-deck to use the new version.")
+
+	// Offer to update remotes
+	updateRemotesAfterLocalUpdate(info.LatestVersion)
 }
 
 func runHomebrewUpgradeWithRefresh(homebrewUpgradeCmd string) error {
@@ -2094,12 +2271,14 @@ func printHelp() {
 	fmt.Println("  mcp              Manage MCP servers")
 	fmt.Println("  skill            Manage Claude skills")
 	fmt.Println("  codex-hooks      Manage Codex notify hook integration")
+	fmt.Println("  gemini-hooks     Manage Gemini hook integration")
 	fmt.Println("  group            Manage groups")
 	fmt.Println("  worktree, wt     Manage git worktrees")
 	fmt.Println("  web              Start TUI with web UI server running alongside")
 	fmt.Println("  conductor        Manage conductor meta-agent orchestration")
 	fmt.Println("  profile          Manage profiles")
 	fmt.Println("  update           Check for and install updates")
+	fmt.Println("  debug-dump       Dump debug ring buffer to file for sharing")
 	fmt.Println("  uninstall        Uninstall Agent Deck")
 	fmt.Println("  version          Show version")
 	fmt.Println("  help             Show this help")
@@ -2129,6 +2308,9 @@ func printHelp() {
 	fmt.Println("  codex-hooks install       Install or upgrade Codex notify hook")
 	fmt.Println("  codex-hooks uninstall     Remove Codex notify hook")
 	fmt.Println("  codex-hooks status        Show Codex hook install status")
+	fmt.Println("  gemini-hooks install      Install Gemini hooks")
+	fmt.Println("  gemini-hooks uninstall    Remove Gemini hooks")
+	fmt.Println("  gemini-hooks status       Show Gemini hooks install status")
 	fmt.Println()
 	fmt.Println("Group Commands:")
 	fmt.Println("  group list                List all groups")
@@ -2234,6 +2416,36 @@ func detectTool(cmd string) string {
 }
 
 // handleUninstall removes agent-deck from the system
+func handleDebugDump() {
+	baseDir, err := session.GetAgentDeckDir()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: cannot determine agent-deck dir: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Initialize logging just enough to populate the ring buffer from the log file
+	logging.Init(logging.Config{
+		Debug:  true,
+		LogDir: baseDir,
+		Level:  "debug",
+	})
+	defer logging.Shutdown()
+
+	dumpPath := filepath.Join(baseDir, fmt.Sprintf("debug-dump-%d.jsonl", time.Now().Unix()))
+	if err := logging.DumpRingBuffer(dumpPath); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: failed to dump ring buffer: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Also check if the debug.log file exists and report its path
+	debugLogPath := filepath.Join(baseDir, "debug.log")
+	if info, statErr := os.Stat(debugLogPath); statErr == nil {
+		fmt.Printf("Debug log: %s (%.1f MB)\n", debugLogPath, float64(info.Size())/(1024*1024))
+	}
+	fmt.Printf("Ring buffer dumped to: %s\n", dumpPath)
+	fmt.Println("Share this file when reporting lag or stuck issues.")
+}
+
 func handleUninstall(args []string) {
 	fs := flag.NewFlagSet("uninstall", flag.ExitOnError)
 	keepData := fs.Bool("keep-data", false, "Keep ~/.agent-deck/ (sessions, config, logs)")

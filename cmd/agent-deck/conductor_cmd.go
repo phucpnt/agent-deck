@@ -14,6 +14,19 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/session"
 )
 
+// envVarFlags implements flag.Value for repeatable -env KEY=VALUE flags
+type envVarFlags map[string]string
+
+func (e *envVarFlags) String() string { return "" }
+func (e *envVarFlags) Set(val string) error {
+	parts := strings.SplitN(val, "=", 2)
+	if len(parts) != 2 || parts[0] == "" {
+		return fmt.Errorf("invalid env format %q, expected KEY=VALUE", val)
+	}
+	(*e)[parts[0]] = parts[1]
+	return nil
+}
+
 // handleConductor dispatches conductor subcommands
 func handleConductor(profile string, args []string) {
 	if len(args) == 0 {
@@ -93,44 +106,64 @@ func parseConductorSetupArgs(fs *flag.FlagSet, args []string) (string, []string,
 // handleConductorSetup sets up a named conductor with directories, sessions, and optionally the Telegram bridge
 func handleConductorSetup(profile string, args []string) {
 	fs := flag.NewFlagSet("conductor setup", flag.ExitOnError)
-	noClearOnCompact := fs.Bool("no-clear-on-compact", false, "Allow normal compaction instead of /clear when context fills up")
+	agent := fs.String("agent", session.ConductorAgentClaude, "Conductor agent runtime (claude or codex)")
+	noClearOnCompact := fs.Bool("no-clear-on-compact", false, "Claude-only: allow normal compaction instead of /clear when context fills up")
 	description := fs.String("description", "", "Description for this conductor")
 	heartbeat := fs.Bool("heartbeat", false, "Enable heartbeat for this conductor (default)")
 	noHeartbeat := fs.Bool("no-heartbeat", false, "Disable heartbeat for this conductor")
+	instructionsMD := fs.String("instructions-md", "", "Custom instructions file for this conductor (agent-specific, e.g., ~/docs/conductor-ops.md)")
+	sharedInstructionsMD := fs.String("shared-instructions-md", "", "Custom shared instructions file for all conductors of this agent")
 	claudeMD := fs.String("claude-md", "", "Custom CLAUDE.md for this conductor (e.g., ~/docs/conductor-ryan.md)")
 	policyMD := fs.String("policy-md", "", "Custom POLICY.md for this conductor (e.g., ~/docs/my-policy.md)")
 	sharedClaudeMD := fs.String("shared-claude-md", "", "Custom path for shared CLAUDE.md (e.g., ~/docs/conductor-shared.md)")
 	sharedPolicyMD := fs.String("shared-policy-md", "", "Custom path for shared POLICY.md (e.g., ~/docs/conductor-policy.md)")
+	envFile := fs.String("env-file", "", "Path to .env file to source before conductor starts (e.g., ~/.conductor.env)")
+	envFlags := make(envVarFlags)
+	fs.Var(&envFlags, "env", "Environment variable in KEY=VALUE format (can be repeated)")
 	jsonOutput := fs.Bool("json", false, "Output as JSON")
 
 	fs.Usage = func() {
 		fmt.Println("Usage: agent-deck [-p profile] conductor setup <name> [options]")
 		fmt.Println()
-		fmt.Println("Set up a named conductor: creates directory, CLAUDE.md, meta.json, and registers session.")
+		fmt.Println("Set up a named conductor: creates its directory, instructions file, meta.json, and session registration.")
 		fmt.Println("Multiple conductors can exist per profile.")
 		fmt.Println()
 		fmt.Println("Arguments:")
 		fmt.Println("  <name>    Conductor name (e.g., ryan, infra, monitor)")
 		fmt.Println()
 		fmt.Println("Options:")
+		fmt.Println("  -agent string")
+		fmt.Println("        Conductor agent runtime: claude or codex (default \"claude\")")
 		fmt.Println("  -description string")
 		fmt.Println("        Description for this conductor")
 		fmt.Println("  -heartbeat")
 		fmt.Println("        Enable heartbeat for this conductor (default)")
 		fmt.Println("  -no-heartbeat")
 		fmt.Println("        Disable heartbeat for this conductor")
+		fmt.Println("  -no-clear-on-compact")
+		fmt.Println("        Claude-only: allow normal compaction instead of /clear when context fills up")
 		fmt.Println()
 		fmt.Println("Conductor-specific files:")
+		fmt.Println("  -instructions-md string")
+		fmt.Println("        Custom instructions file for this conductor (agent-specific)")
 		fmt.Println("  -claude-md string")
-		fmt.Println("        Custom CLAUDE.md for this conductor (e.g., ~/docs/conductor-ryan.md)")
+		fmt.Println("        Deprecated Claude-only alias for -instructions-md")
 		fmt.Println("  -policy-md string")
 		fmt.Println("        Custom POLICY.md for this conductor (e.g., ~/docs/my-policy.md)")
 		fmt.Println()
 		fmt.Println("Shared files (all conductors):")
+		fmt.Println("  -shared-instructions-md string")
+		fmt.Println("        Custom shared instructions file for all conductors of this agent")
 		fmt.Println("  -shared-claude-md string")
-		fmt.Println("        Custom path for shared CLAUDE.md (e.g., ~/docs/conductor-shared.md)")
+		fmt.Println("        Deprecated Claude-only alias for -shared-instructions-md")
 		fmt.Println("  -shared-policy-md string")
 		fmt.Println("        Custom path for shared POLICY.md (e.g., ~/docs/conductor-policy.md)")
+		fmt.Println()
+		fmt.Println("Environment:")
+		fmt.Println("  -env KEY=VALUE")
+		fmt.Println("        Environment variable for the conductor session (can be repeated)")
+		fmt.Println("  -env-file string")
+		fmt.Println("        Path to .env file to source before conductor starts")
 		fmt.Println()
 		fmt.Println("Output:")
 		fmt.Println("  -json")
@@ -156,6 +189,31 @@ func handleConductorSetup(profile string, args []string) {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
+	spec, err := session.GetConductorAgentSpec(*agent)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	if *instructionsMD != "" && *claudeMD != "" {
+		fmt.Fprintln(os.Stderr, "Error: use only one of -instructions-md or -claude-md")
+		os.Exit(1)
+	}
+	if *sharedInstructionsMD != "" && *sharedClaudeMD != "" {
+		fmt.Fprintln(os.Stderr, "Error: use only one of -shared-instructions-md or -shared-claude-md")
+		os.Exit(1)
+	}
+	resolvedInstructionsMD := *instructionsMD
+	if resolvedInstructionsMD == "" {
+		resolvedInstructionsMD = *claudeMD
+	}
+	resolvedSharedInstructionsMD := *sharedInstructionsMD
+	if resolvedSharedInstructionsMD == "" {
+		resolvedSharedInstructionsMD = *sharedClaudeMD
+	}
+	if spec.Agent != session.ConductorAgentClaude && (*claudeMD != "" || *sharedClaudeMD != "") {
+		fmt.Fprintln(os.Stderr, "Error: -claude-md and -shared-claude-md are only valid with --agent=claude")
+		os.Exit(1)
+	}
 	resolvedProfile := session.GetEffectiveProfile(profile)
 
 	// Auto-migrate legacy conductors
@@ -179,13 +237,14 @@ func handleConductorSetup(profile string, args []string) {
 	settings := config.Conductor
 	telegramConfigured := settings.Telegram.Token != ""
 	slackConfigured := settings.Slack.BotToken != ""
+	discordConfigured := settings.Discord.BotToken != ""
 
 	// Step 2: If conductor system not enabled, run first-time setup
 	if !settings.Enabled {
 		fmt.Println("Conductor Setup")
 		fmt.Println("===============")
 		fmt.Println()
-		fmt.Println("The conductor system lets you create named persistent Claude sessions that")
+		fmt.Printf("The conductor system lets you create named persistent %s conductor sessions that\n", spec.DisplayName)
 		fmt.Println("monitor and orchestrate all your agent-deck sessions.")
 		fmt.Println()
 
@@ -268,12 +327,68 @@ func handleConductorSetup(profile string, args []string) {
 			slackConfigured = true
 		}
 
+		// Ask about Discord
+		fmt.Print("Connect Discord bot for channel-based control? (y/N): ")
+		dcAnswer, _ := reader.ReadString('\n')
+		dcAnswer = strings.TrimSpace(strings.ToLower(dcAnswer))
+
+		var discord session.DiscordSettings
+		if dcAnswer == "y" || dcAnswer == "yes" {
+			fmt.Println()
+			fmt.Println("  1. Create an application at https://discord.com/developers/applications")
+			fmt.Println("  2. Bot tab -> create bot, copy the token")
+			fmt.Println("  3. Enable MESSAGE CONTENT intent in the Bot tab")
+			fmt.Println("  4. OAuth2 -> URL Generator: scopes=[bot, applications.commands],")
+			fmt.Println("     permissions=[Send Messages, Read Message History]")
+			fmt.Println("  5. Invite bot to your server using the generated URL")
+			fmt.Println()
+
+			fmt.Print("Discord bot token: ")
+			dcBotToken, _ := reader.ReadString('\n')
+			dcBotToken = strings.TrimSpace(dcBotToken)
+			if dcBotToken == "" {
+				fmt.Fprintln(os.Stderr, "Error: bot token is required")
+				os.Exit(1)
+			}
+
+			fmt.Print("Discord guild (server) ID: ")
+			dcGuildIDStr, _ := reader.ReadString('\n')
+			dcGuildIDStr = strings.TrimSpace(dcGuildIDStr)
+			dcGuildID, err := strconv.ParseInt(dcGuildIDStr, 10, 64)
+			if err != nil || dcGuildID == 0 {
+				fmt.Fprintln(os.Stderr, "Error: valid guild ID is required")
+				os.Exit(1)
+			}
+
+			fmt.Print("Discord channel ID: ")
+			dcChannelIDStr, _ := reader.ReadString('\n')
+			dcChannelIDStr = strings.TrimSpace(dcChannelIDStr)
+			dcChannelID, err := strconv.ParseInt(dcChannelIDStr, 10, 64)
+			if err != nil || dcChannelID == 0 {
+				fmt.Fprintln(os.Stderr, "Error: valid channel ID is required")
+				os.Exit(1)
+			}
+
+			fmt.Print("Your Discord user ID: ")
+			dcUserIDStr, _ := reader.ReadString('\n')
+			dcUserIDStr = strings.TrimSpace(dcUserIDStr)
+			dcUserID, err := strconv.ParseInt(dcUserIDStr, 10, 64)
+			if err != nil || dcUserID == 0 {
+				fmt.Fprintln(os.Stderr, "Error: valid user ID is required")
+				os.Exit(1)
+			}
+
+			discord = session.DiscordSettings{BotToken: dcBotToken, GuildID: dcGuildID, ChannelID: dcChannelID, UserID: dcUserID}
+			discordConfigured = true
+		}
+
 		// Update config (no longer stores profiles list, conductors are on disk)
 		settings = session.ConductorSettings{
 			Enabled:           true,
 			HeartbeatInterval: 15,
 			Telegram:          telegram,
 			Slack:             slack,
+			Discord:           discord,
 		}
 		config.Conductor = settings
 
@@ -285,13 +400,13 @@ func handleConductorSetup(profile string, args []string) {
 		fmt.Println("[ok] Conductor config saved to config.toml")
 	}
 
-	// Step 3: Install/update shared CLAUDE.md
-	if err := session.InstallSharedClaudeMD(*sharedClaudeMD); err != nil {
-		fmt.Fprintf(os.Stderr, "Error installing shared CLAUDE.md: %v\n", err)
+	// Step 3: Install/update shared instructions file for the selected agent
+	if err := session.InstallSharedConductorInstructions(spec.Agent, resolvedSharedInstructionsMD); err != nil {
+		fmt.Fprintf(os.Stderr, "Error installing shared %s: %v\n", spec.InstructionsFileName, err)
 		os.Exit(1)
 	}
 	if !*jsonOutput {
-		fmt.Println("[ok] Shared CLAUDE.md installed/updated")
+		fmt.Printf("[ok] Shared %s installed/updated\n", spec.InstructionsFileName)
 	}
 
 	// Step 3b: Install/update shared POLICY.md
@@ -318,12 +433,19 @@ func handleConductorSetup(profile string, args []string) {
 	}
 
 	clearOnCompact := !*noClearOnCompact
-	if err := session.SetupConductor(name, resolvedProfile, heartbeatEnabled, clearOnCompact, *description, *claudeMD, *policyMD); err != nil {
+	if !spec.SupportsClearOnCompact {
+		clearOnCompact = false
+	}
+	var envMap map[string]string
+	if len(envFlags) > 0 {
+		envMap = map[string]string(envFlags)
+	}
+	if err := session.SetupConductorWithAgent(name, resolvedProfile, spec.Agent, heartbeatEnabled, clearOnCompact, *description, resolvedInstructionsMD, *policyMD, envMap, *envFile); err != nil {
 		fmt.Fprintf(os.Stderr, "Error setting up conductor %s: %v\n", name, err)
 		os.Exit(1)
 	}
 	if !*jsonOutput {
-		fmt.Printf("  [ok] Directory, CLAUDE.md, and meta.json created\n")
+		fmt.Printf("  [ok] Directory, %s, and meta.json created\n", spec.InstructionsFileName)
 	}
 
 	// Step 5: Register session in the profile's storage
@@ -354,18 +476,26 @@ func handleConductorSetup(profile string, args []string) {
 	if existingID != "" {
 		sessionID = existingID
 		existed = true
+		for _, inst := range instances {
+			if inst.ID != existingID {
+				continue
+			}
+			inst.Tool = spec.Agent
+			inst.Command = spec.DefaultCommand
+			break
+		}
 		if !*jsonOutput {
-			fmt.Printf("  [ok] Session '%s' already registered (ID: %s)\n", sessionTitle, existingID[:8])
+			fmt.Printf("  [ok] Session '%s' already registered and synced to %s (ID: %s)\n", sessionTitle, spec.Agent, existingID[:8])
 		}
 	} else {
 		dir, _ := session.ConductorNameDir(name)
-		newInst := session.NewInstanceWithGroupAndTool(sessionTitle, dir, "conductor", "claude")
-		newInst.Command = "claude"
+		newInst := session.NewInstanceWithGroupAndTool(sessionTitle, dir, "conductor", spec.Agent)
+		newInst.Command = spec.DefaultCommand
 		instances = append(instances, newInst)
 
 		sessionID = newInst.ID
 		if !*jsonOutput {
-			fmt.Printf("  [ok] Session '%s' registered (ID: %s)\n", sessionTitle, newInst.ID[:8])
+			fmt.Printf("  [ok] Session '%s' registered as %s (ID: %s)\n", sessionTitle, spec.Agent, newInst.ID[:8])
 		}
 	}
 
@@ -379,21 +509,27 @@ func handleConductorSetup(profile string, args []string) {
 		os.Exit(1)
 	}
 
-	// Step 6: Install heartbeat timer (if heartbeat enabled)
+	// Step 6: Install heartbeat timer (if heartbeat enabled and interval > 0)
 	if heartbeatEnabled {
 		interval := settings.GetHeartbeatInterval()
-		if err := session.InstallHeartbeatScript(name, resolvedProfile); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to install heartbeat script: %v\n", err)
-		} else if err := session.InstallHeartbeatDaemon(name, resolvedProfile, interval); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to install heartbeat daemon: %v\n", err)
-		} else if !*jsonOutput {
-			fmt.Printf("  [ok] Heartbeat timer installed (every %d min)\n", interval)
+		if interval <= 0 {
+			if !*jsonOutput {
+				fmt.Println("  [skip] Heartbeat disabled (interval = 0)")
+			}
+		} else {
+			if err := session.InstallHeartbeatScript(name, resolvedProfile); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to install heartbeat script: %v\n", err)
+			} else if err := session.InstallHeartbeatDaemon(name, resolvedProfile, interval); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to install heartbeat daemon: %v\n", err)
+			} else if !*jsonOutput {
+				fmt.Printf("  [ok] Heartbeat timer installed (every %d min)\n", interval)
+			}
 		}
 	}
 
-	// Step 7: Install bridge (if Telegram or Slack is configured)
+	// Step 7: Install bridge (if Telegram, Slack, or Discord is configured)
 	var plistPath string
-	if telegramConfigured || slackConfigured {
+	if telegramConfigured || slackConfigured || discordConfigured {
 		if !*jsonOutput {
 			fmt.Println()
 			fmt.Println("Installing bridge...")
@@ -439,6 +575,7 @@ func handleConductorSetup(profile string, args []string) {
 	if *jsonOutput {
 		data := map[string]any{
 			"success":                 true,
+			"agent":                   spec.Agent,
 			"name":                    name,
 			"profile":                 resolvedProfile,
 			"session":                 sessionID,
@@ -446,6 +583,7 @@ func handleConductorSetup(profile string, args []string) {
 			"heartbeat":               heartbeatEnabled,
 			"telegram":                telegramConfigured,
 			"slack":                   slackConfigured,
+			"discord":                 discordConfigured,
 			"notifier_daemon_running": session.IsTransitionNotifierDaemonRunning(),
 		}
 		if plistPath != "" {
@@ -463,6 +601,7 @@ func handleConductorSetup(profile string, args []string) {
 	fmt.Println("Conductor setup complete!")
 	fmt.Println()
 	fmt.Printf("  Name:      %s\n", name)
+	fmt.Printf("  Agent:     %s\n", spec.Agent)
 	fmt.Printf("  Profile:   %s\n", resolvedProfile)
 	fmt.Printf("  Heartbeat: %v\n", heartbeatEnabled)
 	if *description != "" {
@@ -472,7 +611,7 @@ func handleConductorSetup(profile string, args []string) {
 	fmt.Println("Next steps:")
 	fmt.Printf("  agent-deck -p %s session start %s\n", resolvedProfile, sessionTitle)
 	condDir, _ := session.ConductorDir()
-	if telegramConfigured || slackConfigured {
+	if telegramConfigured || slackConfigured || discordConfigured {
 		fmt.Println()
 		if telegramConfigured {
 			fmt.Println("  Test from Telegram: send /status to your bot")
@@ -480,11 +619,15 @@ func handleConductorSetup(profile string, args []string) {
 		if slackConfigured {
 			fmt.Println("  Test from Slack: post a message in the configured channel")
 		}
+		if discordConfigured {
+			fmt.Println("  Test from Discord: post a message in the configured channel or use /ad-status")
+		}
 		fmt.Printf("  View bridge logs:   tail -f %s/bridge.log\n", condDir)
 	} else {
 		fmt.Println()
 		fmt.Println("  To add Telegram later: re-run setup after adding [conductor.telegram] to config.toml")
 		fmt.Println("  To add Slack later: re-run setup after adding [conductor.slack] to config.toml")
+		fmt.Println("  To add Discord later: re-run setup after adding [conductor.discord] to config.toml")
 	}
 }
 
@@ -656,6 +799,7 @@ func handleConductorTeardown(_ string, args []string) {
 			_ = os.Remove(filepath.Join(condDir, "bridge.py"))
 			_ = os.Remove(filepath.Join(condDir, "bridge.log"))
 			_ = os.Remove(filepath.Join(condDir, "CLAUDE.md"))
+			_ = os.Remove(filepath.Join(condDir, "AGENTS.md"))
 			_ = os.Remove(filepath.Join(condDir, "POLICY.md"))
 			_ = os.Remove(filepath.Join(condDir, "LEARNINGS.md"))
 			_ = os.Remove(condDir) // Remove dir if empty
@@ -717,6 +861,10 @@ func handleConductorStatus(_ string, args []string) {
 		os.Exit(1)
 	}
 
+	// Auto-migrate before status check so stale heartbeat scripts self-heal even
+	// when conductors are globally disabled in config.
+	runAutoMigration(*jsonOutput)
+
 	settings := session.GetConductorSettings()
 	if !settings.Enabled {
 		if *jsonOutput {
@@ -727,9 +875,6 @@ func handleConductorStatus(_ string, args []string) {
 		}
 		return
 	}
-
-	// Auto-migrate before status check
-	runAutoMigration(*jsonOutput)
 
 	// Get conductors to display
 	var conductors []session.ConductorMeta
@@ -751,6 +896,7 @@ func handleConductorStatus(_ string, args []string) {
 
 	type conductorStatus struct {
 		Name        string `json:"name"`
+		Agent       string `json:"agent"`
 		Profile     string `json:"profile"`
 		DirExists   bool   `json:"dir_exists"`
 		SessionID   string `json:"session_id,omitempty"`
@@ -764,6 +910,7 @@ func handleConductorStatus(_ string, args []string) {
 	for _, meta := range conductors {
 		cs := conductorStatus{
 			Name:        meta.Name,
+			Agent:       meta.GetAgent(),
 			Profile:     meta.Profile,
 			DirExists:   session.IsConductorSetup(meta.Name),
 			Heartbeat:   meta.HeartbeatEnabled,
@@ -856,7 +1003,7 @@ func handleConductorStatus(_ string, args []string) {
 			desc = fmt.Sprintf("  %q", cs.Description)
 		}
 
-		fmt.Printf("  %s %s [%s] heartbeat:%s  (%s)%s\n", statusIcon, cs.Name, cs.Profile, hb, statusText, desc)
+		fmt.Printf("  %s %s [%s] agent:%s heartbeat:%s  (%s)%s\n", statusIcon, cs.Name, cs.Profile, cs.Agent, hb, statusText, desc)
 	}
 	fmt.Println()
 
@@ -960,7 +1107,7 @@ func handleConductorList(profile string, args []string) {
 			desc = fmt.Sprintf("  %q", meta.Description)
 		}
 
-		fmt.Printf("  %-12s [%s]  heartbeat:%-3s  %-10s%s\n", meta.Name, meta.Profile, hb, statusText, desc)
+		fmt.Printf("  %-12s [%s]  agent:%-6s heartbeat:%-3s  %-10s%s\n", meta.Name, meta.Profile, meta.GetAgent(), hb, statusText, desc)
 	}
 	fmt.Println()
 }
@@ -978,11 +1125,14 @@ func installPythonDeps() {
 		if config.Conductor.Slack.BotToken != "" {
 			packages = append(packages, "slack-bolt", "slack-sdk", "aiohttp")
 		}
+		if config.Conductor.Discord.BotToken != "" {
+			packages = append(packages, "discord.py")
+		}
 	}
 
 	// Fallback: if no specific integration detected, install all
 	if len(packages) == 1 {
-		packages = append(packages, "aiogram", "slack-bolt", "slack-sdk", "aiohttp")
+		packages = append(packages, "aiogram", "slack-bolt", "slack-sdk", "aiohttp", "discord.py")
 	}
 
 	args := append([]string{"-m", "pip", "install", "--quiet", "--user"}, packages...)
@@ -1013,6 +1163,7 @@ func printConductorHelp() {
 	fmt.Println()
 	fmt.Println("Examples:")
 	fmt.Println("  agent-deck -p work conductor setup ryan --description \"Ryan project\"")
+	fmt.Println("  agent-deck -p work conductor setup review --agent codex --description \"Codex reviewer\"")
 	fmt.Println("  agent-deck -p work conductor setup infra --no-heartbeat")
 	fmt.Println("  agent-deck conductor list")
 	fmt.Println("  agent-deck conductor status")

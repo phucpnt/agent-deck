@@ -277,7 +277,13 @@ install_macos_package() {
     echo -e "Installing $PACKAGE_NAME via $mgr_name..."
     case "$MACOS_PKG_MANAGER" in
         brew) brew install "$PACKAGE_NAME" ;;
-        port) sudo port install "$PACKAGE_NAME" ;;
+        port)
+            if [[ "$SKIP_OPTIONAL_DEPS" == "true" ]]; then
+                sudo -n port install "$PACKAGE_NAME"
+            else
+                sudo port install "$PACKAGE_NAME"
+            fi
+            ;;
     esac
 }
 
@@ -300,10 +306,17 @@ if ! command -v tmux &> /dev/null; then
     if [[ "$OS" == "darwin" ]]; then
         if [[ -n "$MACOS_PKG_MANAGER" ]]; then
             mgr_name="$(macos_pkg_mgr_name "$MACOS_PKG_MANAGER")"
-            read -p "Install tmux via $mgr_name? [Y/n] " -n 1 -r
-            echo
-            if [[ ! $REPLY =~ ^[Nn]$ ]]; then
-                install_macos_package "tmux"
+            if [[ "$SKIP_OPTIONAL_DEPS" == "true" ]]; then
+                echo -e "Installing tmux via $mgr_name (non-interactive)..."
+                if ! install_macos_package "tmux"; then
+                    echo -e "${YELLOW}Warning: automatic tmux install failed in non-interactive mode.${NC}"
+                fi
+            else
+                read -p "Install tmux via $mgr_name? [Y/n] " -n 1 -r
+                echo
+                if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+                    install_macos_package "tmux"
+                fi
             fi
         else
             print_macos_manual_install_help "tmux"
@@ -311,25 +324,46 @@ if ! command -v tmux &> /dev/null; then
     else
         # Linux - try apt, dnf, or pacman
         if command -v apt-get &> /dev/null; then
-            read -p "Install tmux via apt? [Y/n] " -n 1 -r
-            echo
-            if [[ ! $REPLY =~ ^[Nn]$ ]]; then
-                echo -e "Installing tmux..."
-                sudo apt-get update && sudo apt-get install -y tmux
+            if [[ "$SKIP_OPTIONAL_DEPS" == "true" ]]; then
+                echo -e "Installing tmux via apt (non-interactive)..."
+                if ! { sudo -n apt-get update && sudo -n apt-get install -y tmux; }; then
+                    echo -e "${YELLOW}Warning: automatic tmux install via apt failed in non-interactive mode.${NC}"
+                fi
+            else
+                read -p "Install tmux via apt? [Y/n] " -n 1 -r
+                echo
+                if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+                    echo -e "Installing tmux..."
+                    sudo apt-get update && sudo apt-get install -y tmux
+                fi
             fi
         elif command -v dnf &> /dev/null; then
-            read -p "Install tmux via dnf? [Y/n] " -n 1 -r
-            echo
-            if [[ ! $REPLY =~ ^[Nn]$ ]]; then
-                echo -e "Installing tmux..."
-                sudo dnf install -y tmux
+            if [[ "$SKIP_OPTIONAL_DEPS" == "true" ]]; then
+                echo -e "Installing tmux via dnf (non-interactive)..."
+                if ! sudo -n dnf install -y tmux; then
+                    echo -e "${YELLOW}Warning: automatic tmux install via dnf failed in non-interactive mode.${NC}"
+                fi
+            else
+                read -p "Install tmux via dnf? [Y/n] " -n 1 -r
+                echo
+                if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+                    echo -e "Installing tmux..."
+                    sudo dnf install -y tmux
+                fi
             fi
         elif command -v pacman &> /dev/null; then
-            read -p "Install tmux via pacman? [Y/n] " -n 1 -r
-            echo
-            if [[ ! $REPLY =~ ^[Nn]$ ]]; then
-                echo -e "Installing tmux..."
-                sudo pacman -S --noconfirm tmux
+            if [[ "$SKIP_OPTIONAL_DEPS" == "true" ]]; then
+                echo -e "Installing tmux via pacman (non-interactive)..."
+                if ! sudo -n pacman -S --noconfirm tmux; then
+                    echo -e "${YELLOW}Warning: automatic tmux install via pacman failed in non-interactive mode.${NC}"
+                fi
+            else
+                read -p "Install tmux via pacman? [Y/n] " -n 1 -r
+                echo
+                if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+                    echo -e "Installing tmux..."
+                    sudo pacman -S --noconfirm tmux
+                fi
             fi
         else
             echo "Please install tmux manually:"
@@ -341,11 +375,15 @@ if ! command -v tmux &> /dev/null; then
 
     # Check again after attempted install
     if ! command -v tmux &> /dev/null; then
-        echo ""
-        read -p "tmux not found. Continue anyway? [y/N] " -n 1 -r
-        echo
-        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-            exit 1
+        if [[ "$SKIP_OPTIONAL_DEPS" == "true" ]]; then
+            echo -e "${YELLOW}Warning: tmux not found. Continuing without tmux (non-interactive).${NC}"
+        else
+            echo ""
+            read -p "tmux not found. Continue anyway? [y/N] " -n 1 -r
+            echo
+            if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+                exit 1
+            fi
         fi
     else
         echo -e "${GREEN}tmux installed successfully!${NC}"
@@ -431,12 +469,48 @@ if ! curl -fsSL "$DOWNLOAD_URL" -o "$TMP_DIR/agent-deck.tar.gz"; then
     echo -e "${RED}Error: Download failed${NC}"
     echo "URL: $DOWNLOAD_URL"
     echo ""
-    echo "This could mean:"
-    echo "  - The version doesn't exist"
-    echo "  - The release hasn't been published yet"
-    echo "  - Network issues"
+
+    # Check if the release exists but has no assets (common when GoReleaser hasn't completed yet)
+    RELEASE_JSON=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/tags/${VERSION}" 2>/dev/null || true)
+
+    # Parse asset list: prefer jq for reliability, fall back to grep
+    if command -v jq &> /dev/null && [[ -n "$RELEASE_JSON" ]]; then
+        ASSET_NAMES=$(echo "$RELEASE_JSON" | jq -r '.assets[].name // empty' 2>/dev/null || true)
+        ASSET_COUNT=$(echo "$RELEASE_JSON" | jq '.assets | length' 2>/dev/null || echo "0")
+    else
+        ASSET_NAMES=$(echo "$RELEASE_JSON" | grep '"name"' | sed 's/.*"name": *"\([^"]*\)".*/\1/' | grep '\.tar\.gz\|checksums' || true)
+        ASSET_COUNT=$(echo "$RELEASE_JSON" | grep -c '"browser_download_url"' || echo "0")
+    fi
+
+    if [[ "$ASSET_COUNT" -eq 0 ]]; then
+        echo "The release ${VERSION} exists but has no downloadable binaries."
+        echo "This usually means the release CI workflow hasn't completed yet."
+        echo "Wait a few minutes and try again, or check: https://github.com/${REPO}/actions"
+    else
+        # Release has assets, but not for this platform
+        echo "The release ${VERSION} has ${ASSET_COUNT} assets, but not for ${OS}/${ARCH}."
+        if [[ -n "$ASSET_NAMES" ]]; then
+            echo ""
+            echo "Available assets:"
+            echo "$ASSET_NAMES" | while IFS= read -r name; do
+                [[ -n "$name" ]] && echo "  - $name"
+            done
+        fi
+        echo ""
+        echo "This could mean:"
+        echo "  - The version doesn't exist for your platform"
+        echo "  - Network issues"
+    fi
     echo ""
-    echo "Try building from source instead:"
+
+    # Suggest Homebrew first if available (most reliable)
+    if [[ "$OS" == "darwin" ]] && command -v brew &> /dev/null; then
+        echo "Install via Homebrew instead (recommended):"
+        echo "  brew install asheshgoplani/tap/agent-deck"
+        echo ""
+    fi
+
+    echo "Or build from source:"
     echo "  git clone https://github.com/${REPO}.git"
     echo "  cd agent-deck && make install"
     exit 1
@@ -477,7 +551,7 @@ configure_tmux() {
     local TMUX_CONF="$HOME/.tmux.conf"
     local MARKER="# agent-deck configuration"
     local VERSION_MARKER="# agent-deck-tmux-config-version:"
-    local CURRENT_VERSION="2"  # Bump this when config changes
+    local CURRENT_VERSION="3"  # Bump this when config changes
     local NEEDS_UPDATE=false
     local HAS_CONFIG=false
 
@@ -497,6 +571,7 @@ configure_tmux() {
             fi
             echo ""
             echo -e "${BLUE}What's new in this update:${NC}"
+            echo "  • Added extended-keys for Shift+Enter support (tmux 3.2+)"
             echo "  • Fixed mouse scrolling issues on WSL"
             echo "  • Added auto-enter copy-mode on scroll up"
             echo "  • Added explicit scroll bindings for copy-mode"
@@ -593,6 +668,10 @@ set -ag terminal-overrides \",*256col*:Tc\"
 # Performance
 set -sg escape-time 0
 set -g history-limit 50000
+
+# Extended keys: forward Shift+Enter and other modified keys to apps (tmux 3.2+)
+set -s extended-keys on
+set -as terminal-features 'tmux-256color:extkeys'
 
 # Mouse support (scroll + drag-to-copy)
 set -g mouse on

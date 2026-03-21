@@ -1,11 +1,34 @@
 package ui
 
 import (
+	"os"
+	"path/filepath"
+	"reflect"
 	"testing"
 
 	"github.com/asheshgoplani/agent-deck/internal/session"
 	tea "github.com/charmbracelet/bubbletea"
 )
+
+func setSettingsPanelHotkeyConfigForTest(t *testing.T, tomlBody string) {
+	t.Helper()
+
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+
+	configDir := filepath.Join(homeDir, ".agent-deck")
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		t.Fatalf("failed to create config directory: %v", err)
+	}
+
+	configPath := filepath.Join(configDir, session.UserConfigFileName)
+	if err := os.WriteFile(configPath, []byte(tomlBody), 0o600); err != nil {
+		t.Fatalf("failed to write config.toml: %v", err)
+	}
+
+	session.ClearUserConfigCache()
+	t.Cleanup(session.ClearUserConfigCache)
+}
 
 func TestSettingsPanel_InitialState(t *testing.T) {
 	panel := NewSettingsPanel()
@@ -45,6 +68,11 @@ func TestSettingsPanel_LoadConfig(t *testing.T) {
 		Claude: session.ClaudeSettings{
 			DangerousMode: &dangerousModeBool,
 			ConfigDir:     "~/.claude-work",
+			UseHappy:      true,
+		},
+		Codex: session.CodexSettings{
+			UseHappy: true,
+			YoloMode: true,
 		},
 		Updates: session.UpdateSettings{
 			CheckEnabled: false,
@@ -72,6 +100,15 @@ func TestSettingsPanel_LoadConfig(t *testing.T) {
 	}
 	if panel.claudeConfigDir != "~/.claude-work" {
 		t.Errorf("claudeConfigDir: got %q, want %q", panel.claudeConfigDir, "~/.claude-work")
+	}
+	if !panel.claudeUseHappy {
+		t.Error("claudeUseHappy should be true")
+	}
+	if !panel.codexUseHappy {
+		t.Error("codexUseHappy should be true")
+	}
+	if !panel.codexYoloMode {
+		t.Error("codexYoloMode should be true")
 	}
 	if panel.checkForUpdates {
 		t.Error("checkForUpdates should be false")
@@ -141,8 +178,9 @@ func TestSettingsPanel_LoadConfig_DefaultTool(t *testing.T) {
 		{"gemini", "gemini", 1},
 		{"opencode", "opencode", 2},
 		{"codex", "codex", 3},
-		{"empty", "", 4}, // None
-		{"unknown", "unknown-tool", 4},
+		{"pi", "pi", 4},
+		{"empty", "", 5}, // None
+		{"unknown", "unknown-tool", 5},
 	}
 
 	for _, tt := range tests {
@@ -156,6 +194,34 @@ func TestSettingsPanel_LoadConfig_DefaultTool(t *testing.T) {
 					tt.tool, panel.selectedTool, tt.expected)
 			}
 		})
+	}
+}
+
+func TestSettingsPanel_LoadConfig_CustomTools(t *testing.T) {
+	panel := NewSettingsPanel()
+
+	config := &session.UserConfig{
+		DefaultTool: "openclaw",
+		Tools: map[string]session.ToolDef{
+			"openclaw": {},
+			"zeta":     {},
+			"claude":   {},
+		},
+	}
+
+	panel.LoadConfig(config)
+
+	wantNames := []string{"Claude", "Gemini", "OpenCode", "Codex", "Pi", "Openclaw", "Zeta", "None"}
+	wantValues := []string{"claude", "gemini", "opencode", "codex", "pi", "openclaw", "zeta", ""}
+
+	if !reflect.DeepEqual(panel.toolNames, wantNames) {
+		t.Fatalf("toolNames = %#v, want %#v", panel.toolNames, wantNames)
+	}
+	if !reflect.DeepEqual(panel.toolValues, wantValues) {
+		t.Fatalf("toolValues = %#v, want %#v", panel.toolValues, wantValues)
+	}
+	if panel.selectedTool != 5 {
+		t.Fatalf("selectedTool = %d, want 5 for openclaw", panel.selectedTool)
 	}
 }
 
@@ -195,6 +261,9 @@ func TestSettingsPanel_GetConfig(t *testing.T) {
 	panel.selectedTool = 2 // opencode
 	panel.dangerousMode = true
 	panel.claudeConfigDir = "~/.claude-custom"
+	panel.claudeUseHappy = true
+	panel.codexUseHappy = true
+	panel.codexYoloMode = true
 	panel.checkForUpdates = false
 	panel.autoUpdate = true
 	panel.logMaxSizeMB = 15
@@ -214,6 +283,15 @@ func TestSettingsPanel_GetConfig(t *testing.T) {
 	}
 	if config.Claude.ConfigDir != "~/.claude-custom" {
 		t.Errorf("ConfigDir: got %q, want %q", config.Claude.ConfigDir, "~/.claude-custom")
+	}
+	if !config.Claude.UseHappy {
+		t.Error("Claude.UseHappy should be true")
+	}
+	if !config.Codex.UseHappy {
+		t.Error("Codex.UseHappy should be true")
+	}
+	if !config.Codex.YoloMode {
+		t.Error("Codex.YoloMode should be true")
 	}
 	if config.Updates.CheckEnabled {
 		t.Error("CheckEnabled should be false")
@@ -302,7 +380,8 @@ func TestSettingsPanel_GetConfig_ToolMapping(t *testing.T) {
 		{"gemini", 1, "gemini"},
 		{"opencode", 2, "opencode"},
 		{"codex", 3, "codex"},
-		{"none", 4, ""},
+		{"pi", 4, "pi"},
+		{"none", 5, ""},
 	}
 
 	for _, tt := range tests {
@@ -314,6 +393,21 @@ func TestSettingsPanel_GetConfig_ToolMapping(t *testing.T) {
 					tt.index, config.DefaultTool, tt.expected)
 			}
 		})
+	}
+}
+
+func TestSettingsPanel_GetConfig_CustomToolMapping(t *testing.T) {
+	panel := NewSettingsPanel()
+	panel.LoadConfig(&session.UserConfig{
+		Tools: map[string]session.ToolDef{
+			"openclaw": {},
+		},
+	})
+
+	panel.selectedTool = 5
+	config := panel.GetConfig()
+	if config.DefaultTool != "openclaw" {
+		t.Fatalf("DefaultTool: got %q, want %q", config.DefaultTool, "openclaw")
 	}
 }
 
@@ -415,6 +509,29 @@ func TestSettingsPanel_Update_ToggleCheckbox(t *testing.T) {
 	panel.Update(tea.KeyMsg{Type: tea.KeySpace})
 	if panel.dangerousMode != initialValue {
 		t.Error("dangerousMode should have toggled back")
+	}
+}
+
+func TestSettingsPanel_Update_ToggleHappyCheckboxes(t *testing.T) {
+	panel := NewSettingsPanel()
+	panel.Show()
+
+	panel.cursor = int(SettingClaudeUseHappy)
+	_, _, changed := panel.Update(tea.KeyMsg{Type: tea.KeySpace})
+	if !changed {
+		t.Fatal("Claude use_happy toggle should report a change")
+	}
+	if !panel.claudeUseHappy {
+		t.Fatal("claudeUseHappy should toggle on")
+	}
+
+	panel.cursor = int(SettingCodexUseHappy)
+	_, _, changed = panel.Update(tea.KeyMsg{Type: tea.KeySpace})
+	if !changed {
+		t.Fatal("Codex use_happy toggle should report a change")
+	}
+	if !panel.codexUseHappy {
+		t.Fatal("codexUseHappy should toggle on")
 	}
 }
 
@@ -544,8 +661,9 @@ func TestSettingsPanel_View_NotVisible(t *testing.T) {
 
 func TestSettingsPanel_View_Visible(t *testing.T) {
 	panel := NewSettingsPanel()
-	panel.SetSize(80, 40)
+	panel.SetSize(100, 80)
 	panel.Show()
+	panel.cursor = int(SettingMaintenanceEnabled)
 
 	view := panel.View()
 	if view == "" {
@@ -563,6 +681,7 @@ func TestSettingsPanel_View_Visible(t *testing.T) {
 		"Gemini",
 		"CLAUDE",
 		"Dangerous mode",
+		"Use happy wrapper",
 		"UPDATES",
 		"LOGS",
 		"GLOBAL SEARCH",
@@ -796,6 +915,36 @@ func TestSettingsPanel_PreviewSettings_GetConfig(t *testing.T) {
 	}
 }
 
+func TestSettingsPanel_PreviewSettings_GetConfigPreservesHiddenFields(t *testing.T) {
+	panel := NewSettingsPanel()
+	panel.showOutput = false
+	panel.showAnalytics = true
+
+	showNotes := false
+	showTools := false
+	panel.originalConfig = &session.UserConfig{
+		Preview: session.PreviewSettings{
+			ShowNotes:        &showNotes,
+			NotesOutputSplit: 0.42,
+			Analytics: session.AnalyticsDisplaySettings{
+				ShowTools: &showTools,
+			},
+		},
+	}
+
+	config := panel.GetConfig()
+
+	if config.Preview.ShowNotes == nil || *config.Preview.ShowNotes {
+		t.Fatal("Preview.ShowNotes should be preserved as false")
+	}
+	if config.Preview.NotesOutputSplit != 0.42 {
+		t.Fatalf("Preview.NotesOutputSplit = %v, want 0.42", config.Preview.NotesOutputSplit)
+	}
+	if config.Preview.Analytics.ShowTools == nil || *config.Preview.Analytics.ShowTools {
+		t.Fatal("Preview.Analytics should preserve original hidden settings")
+	}
+}
+
 func TestSettingsPanel_PreviewSettings_ViewContains(t *testing.T) {
 	panel := NewSettingsPanel()
 	panel.SetSize(80, 50)
@@ -813,5 +962,32 @@ func TestSettingsPanel_PreviewSettings_ViewContains(t *testing.T) {
 		if !containsString(view, elem) {
 			t.Errorf("View() should contain %q", elem)
 		}
+	}
+}
+
+func TestSettingsPanel_ViewUsesConfiguredMCPHotkeyHint(t *testing.T) {
+	setSettingsPanelHotkeyConfigForTest(t, "[hotkeys]\nmcp_manager = \"ctrl+m\"\n")
+
+	panel := NewSettingsPanel()
+	panel.SetSize(100, 80)
+	panel.Show()
+
+	view := panel.View()
+	if !containsString(view, "Press ctrl+m on any Claude/Gemini session to attach MCPs.") {
+		t.Fatalf("settings view should show configured MCP key hint, got %q", view)
+	}
+}
+
+func TestSettingsPanel_ViewShowsUnboundMCPHotkeyHint(t *testing.T) {
+	setSettingsPanelHotkeyConfigForTest(t, "[hotkeys]\nmcp_manager = \"\"\n")
+
+	panel := NewSettingsPanel()
+	panel.SetSize(100, 80)
+	panel.Show()
+	panel.cursor = int(SettingMaintenanceEnabled)
+
+	view := panel.View()
+	if !containsString(view, "MCP Manager hotkey is unbound.") {
+		t.Fatalf("settings view should show unbound MCP key hint, got %q", view)
 	}
 }

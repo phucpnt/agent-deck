@@ -14,6 +14,7 @@ func TestUserConfig_ClaudeConfigDir(t *testing.T) {
 	configContent := `
 [claude]
 config_dir = "~/.claude-work"
+use_happy = true
 
 [tools.test]
 command = "test"
@@ -32,6 +33,9 @@ command = "test"
 
 	if config.Claude.ConfigDir != "~/.claude-work" {
 		t.Errorf("Claude.ConfigDir = %s, want ~/.claude-work", config.Claude.ConfigDir)
+	}
+	if !config.Claude.UseHappy {
+		t.Error("Claude.UseHappy should be true")
 	}
 }
 
@@ -92,6 +96,105 @@ command = "test"
 
 	if config.Claude.ConfigDir != "" {
 		t.Errorf("Claude.ConfigDir = %s, want empty string", config.Claude.ConfigDir)
+	}
+	if config.Claude.UseHappy {
+		t.Error("Claude.UseHappy should default to false")
+	}
+}
+
+func TestUserConfig_CodexUseHappy(t *testing.T) {
+	tmpDir := t.TempDir()
+	configContent := `
+[codex]
+yolo_mode = true
+use_happy = true
+`
+	configPath := filepath.Join(tmpDir, "config.toml")
+	if err := os.WriteFile(configPath, []byte(configContent), 0600); err != nil {
+		t.Fatalf("Failed to write config file: %v", err)
+	}
+
+	var config UserConfig
+	if _, err := toml.DecodeFile(configPath, &config); err != nil {
+		t.Fatalf("Failed to decode: %v", err)
+	}
+
+	if !config.Codex.YoloMode {
+		t.Error("Codex.YoloMode should be true")
+	}
+	if !config.Codex.UseHappy {
+		t.Error("Codex.UseHappy should be true")
+	}
+}
+
+func TestIsClaudeCommand(t *testing.T) {
+	tests := []struct {
+		name    string
+		command string
+		want    bool
+	}{
+		{name: "plain claude", command: "claude", want: true},
+		{name: "absolute path", command: "/opt/homebrew/bin/claude", want: true},
+		{name: "with args", command: "claude --continue", want: true},
+		{name: "env prefix", command: "ANTHROPIC_BASE_URL=https://example.com claude --continue", want: true},
+		{name: "quoted token", command: "'claude' --continue", want: true},
+		{name: "env only", command: "ANTHROPIC_BASE_URL=https://example.com", want: false},
+		{name: "different tool", command: "codex --model gpt-5", want: false},
+		{name: "empty", command: "   ", want: false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := isClaudeCommand(tc.command)
+			if got != tc.want {
+				t.Fatalf("isClaudeCommand(%q) = %v, want %v", tc.command, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestIsClaudeCompatible_CustomToolCommands(t *testing.T) {
+	tmpDir := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", tmpDir)
+	defer os.Setenv("HOME", originalHome)
+	ClearUserConfigCache()
+
+	agentDeckDir := filepath.Join(tmpDir, ".agent-deck")
+	if err := os.MkdirAll(agentDeckDir, 0o700); err != nil {
+		t.Fatalf("mkdir %s: %v", agentDeckDir, err)
+	}
+
+	cfg := &UserConfig{
+		Tools: map[string]ToolDef{
+			"claude_path": {
+				Command: "/opt/homebrew/bin/claude --resume",
+			},
+			"claude_env": {
+				Command: "ANTHROPIC_BASE_URL=https://example.com claude --continue",
+			},
+			"other": {
+				Command: "codex --model gpt-5",
+			},
+		},
+	}
+
+	if err := SaveUserConfig(cfg); err != nil {
+		t.Fatalf("SaveUserConfig: %v", err)
+	}
+	ClearUserConfigCache()
+
+	if !IsClaudeCompatible("claude") {
+		t.Fatal("built-in claude should be Claude-compatible")
+	}
+	if !IsClaudeCompatible("claude_path") {
+		t.Fatal("custom tool with Claude path should be Claude-compatible")
+	}
+	if !IsClaudeCompatible("claude_env") {
+		t.Fatal("custom tool with env-prefixed Claude command should be Claude-compatible")
+	}
+	if IsClaudeCompatible("other") {
+		t.Fatal("non-Claude custom tool should not be Claude-compatible")
 	}
 }
 
@@ -376,6 +479,54 @@ func TestGetWorktreeSettings_FromConfig(t *testing.T) {
 	}
 }
 
+func TestWorktreeSettings_Prefix_Default(t *testing.T) {
+	settings := WorktreeSettings{}
+	if got := settings.Prefix(); got != "feature/" {
+		t.Errorf("Prefix() with nil BranchPrefix: got %q, want %q", got, "feature/")
+	}
+}
+
+func TestWorktreeSettings_Prefix_Custom(t *testing.T) {
+	strPtr := func(s string) *string { return &s }
+	settings := WorktreeSettings{BranchPrefix: strPtr("dev/")}
+	if got := settings.Prefix(); got != "dev/" {
+		t.Errorf("Prefix() with custom BranchPrefix: got %q, want %q", got, "dev/")
+	}
+}
+
+func TestWorktreeSettings_Prefix_Empty(t *testing.T) {
+	strPtr := func(s string) *string { return &s }
+	settings := WorktreeSettings{BranchPrefix: strPtr("")}
+	if got := settings.Prefix(); got != "" {
+		t.Errorf("Prefix() with empty BranchPrefix: got %q, want %q", got, "")
+	}
+}
+
+func TestGetWorktreeSettings_BranchPrefix(t *testing.T) {
+	tempDir := t.TempDir()
+	originalHome := os.Getenv("HOME")
+	os.Setenv("HOME", tempDir)
+	defer os.Setenv("HOME", originalHome)
+	ClearUserConfigCache()
+
+	// Create config with custom branch_prefix
+	agentDeckDir := filepath.Join(tempDir, ".agent-deck")
+	_ = os.MkdirAll(agentDeckDir, 0700)
+	strPtr := func(s string) *string { return &s }
+	config := &UserConfig{
+		Worktree: WorktreeSettings{
+			BranchPrefix: strPtr("custom/"),
+		},
+	}
+	_ = SaveUserConfig(config)
+	ClearUserConfigCache()
+
+	settings := GetWorktreeSettings()
+	if got := settings.Prefix(); got != "custom/" {
+		t.Errorf("GetWorktreeSettings Prefix(): got %q, want %q", got, "custom/")
+	}
+}
+
 // ============================================================================
 // Preview Settings Tests
 // ============================================================================
@@ -414,12 +565,15 @@ show_analytics = false
 func TestPreviewSettingsDefaults(t *testing.T) {
 	cfg := &UserConfig{}
 
-	// Default: output ON, analytics OFF
+	// Default: output ON, analytics OFF, notes ON
 	if !cfg.GetShowOutput() {
 		t.Error("GetShowOutput should default to true")
 	}
 	if cfg.GetShowAnalytics() {
 		t.Error("GetShowAnalytics should default to false")
+	}
+	if !cfg.GetShowNotes() {
+		t.Error("GetShowNotes should default to true")
 	}
 }
 
@@ -477,6 +631,32 @@ show_output = true
 	if config.GetShowAnalytics() {
 		t.Error("GetShowAnalytics should default to false when not set")
 	}
+	if !config.GetShowNotes() {
+		t.Error("GetShowNotes should default to true when not set")
+	}
+}
+
+func TestPreviewSettingsShowNotesExplicitFalse(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+
+	content := `
+[preview]
+show_notes = false
+`
+	if err := os.WriteFile(configPath, []byte(content), 0o644); err != nil {
+		t.Fatalf("Failed to write config file: %v", err)
+	}
+
+	var config UserConfig
+	_, err := toml.DecodeFile(configPath, &config)
+	if err != nil {
+		t.Fatalf("Failed to decode: %v", err)
+	}
+
+	if config.GetShowNotes() {
+		t.Error("GetShowNotes should be false when explicitly disabled")
+	}
 }
 
 func TestGetPreviewSettings(t *testing.T) {
@@ -526,6 +706,62 @@ show_analytics = false
 	}
 	if settings.GetShowAnalytics() {
 		t.Error("GetPreviewSettings ShowAnalytics: should be false from config")
+	}
+}
+
+func TestPreviewSettingsNotesOutputSplitDefaultsAndClamp(t *testing.T) {
+	settings := PreviewSettings{}
+	if got := settings.GetNotesOutputSplit(); got != 0.33 {
+		t.Fatalf("GetNotesOutputSplit default = %v, want 0.33", got)
+	}
+
+	settings.NotesOutputSplit = 0.05
+	if got := settings.GetNotesOutputSplit(); got != 0.1 {
+		t.Fatalf("GetNotesOutputSplit low clamp = %v, want 0.1", got)
+	}
+
+	settings.NotesOutputSplit = 0.95
+	if got := settings.GetNotesOutputSplit(); got != 0.9 {
+		t.Fatalf("GetNotesOutputSplit high clamp = %v, want 0.9", got)
+	}
+
+	settings.NotesOutputSplit = 0.4
+	if got := settings.GetNotesOutputSplit(); got != 0.4 {
+		t.Fatalf("GetNotesOutputSplit configured = %v, want 0.4", got)
+	}
+}
+
+func TestInstanceSettingsFollowCwdOnAttach(t *testing.T) {
+	settings := InstanceSettings{}
+	if settings.GetFollowCwdOnAttach() {
+		t.Fatal("GetFollowCwdOnAttach should default to false")
+	}
+
+	enabled := true
+	settings.FollowCwdOnAttach = &enabled
+	if !settings.GetFollowCwdOnAttach() {
+		t.Fatal("GetFollowCwdOnAttach should return explicit true")
+	}
+}
+
+func TestUserConfigParseFollowCwdOnAttach(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	content := `
+[instances]
+follow_cwd_on_attach = true
+`
+	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
+		t.Fatalf("Failed to write config file: %v", err)
+	}
+
+	var config UserConfig
+	if _, err := toml.DecodeFile(configPath, &config); err != nil {
+		t.Fatalf("Failed to decode: %v", err)
+	}
+
+	if !config.Instances.GetFollowCwdOnAttach() {
+		t.Fatal("instances.follow_cwd_on_attach should parse as true")
 	}
 }
 
