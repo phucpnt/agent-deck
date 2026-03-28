@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"fmt"
 	"sort"
 	"strings"
 	"unicode"
@@ -349,7 +350,7 @@ func DetachByteFromBinding(binding string) byte {
 // DetachByteLabel returns a human-readable label for a detach byte (e.g. "Ctrl+Q").
 func DetachByteLabel(b byte) string {
 	if b >= 1 && b <= 26 {
-		return "Ctrl+" + string(rune('A'+b-1))
+		return fmt.Sprintf("Ctrl+%c", 'A'+b-1)
 	}
 	switch b {
 	case 0x1C:
