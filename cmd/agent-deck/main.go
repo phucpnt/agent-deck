@@ -289,6 +289,9 @@ func main() {
 		case "gemini-hooks":
 			handleGeminiHooks(args[1:])
 			return
+		case "notify":
+			handleNotify(profile, args[1:])
+			return
 		case "notify-daemon":
 			handleNotifyDaemon(args[1:])
 			return

@@ -41,6 +41,13 @@ Each conductor has its own identity in its subdirectory and its own policy in PO
 | ` + "`" + `agent-deck -p <PROFILE> launch <path> -t "Title" -c {AGENT} -g "group" -m "prompt"` + "`" + ` | Create + start + send initial prompt in one command (preferred for new task sessions) |
 | ` + "`" + `agent-deck -p <PROFILE> add <path> -t "Title" -c {AGENT} --worktree feature/branch -b` + "`" + ` | Create a new {AGENT_DISPLAY} session with a worktree |
 
+### Notifications
+| Command | Description |
+|---------|-------------|
+| ` + "`" + `agent-deck -p <PROFILE> notify --tg <chat_id> "message"` + "`" + ` | Push a notification to Telegram chat |
+| ` + "`" + `agent-deck -p <PROFILE> notify --slack <channel_id> "message"` + "`" + ` | Push a notification to Slack channel |
+| ` + "`" + `agent-deck -p <PROFILE> notify --discord <channel_id> "message"` + "`" + ` | Push a notification to Discord channel |
+
 ### Session Resolution
 Commands accept: **exact title**, **ID prefix** (e.g., first 4 chars), **path**, or **fuzzy match**.
 
@@ -78,12 +85,54 @@ NEED: api-fix - asking whether to run integration tests against staging or prod
 
 The bridge parses your response: if it contains ` + "`" + `NEED:` + "`" + ` lines, those get sent to the user via Telegram and/or Slack.
 
+## Proactive Notifications
+
+You can push status updates directly to the user's chat (Telegram, Slack, or Discord) without waiting for them to ask. Use the ` + "`" + `agent-deck notify` + "`" + ` command.
+
+### Command Syntax
+
+` + "```bash" + `
+agent-deck -p {PROFILE} notify --tg <chat_id> "message"
+agent-deck -p {PROFILE} notify --slack <channel_id> "message"
+agent-deck -p {PROFILE} notify --discord <channel_id> "message"
+` + "```" + `
+
+### Chat Context
+
+Every user message includes a ` + "`" + `[chat:<platform>:<chat_id>]` + "`" + ` tag at the start, e.g.:
+
+` + "```" + `
+[chat:telegram:-100123456] How's the frontend task going?
+` + "```" + `
+
+**Extract and persist this.** When you receive a message with a ` + "`" + `[chat:...]` + "`" + ` tag, update ` + "`" + `chat_context` + "`" + ` in your ` + "`" + `state.json` + "`" + ` (see below). Use the stored ` + "`" + `chat_context` + "`" + ` when calling ` + "`" + `notify` + "`" + `.
+
+### When to Notify
+
+| Event | Example Notification |
+|-------|---------------------|
+| Delegating to a session | ` + "`" + `"Delegating frontend auth task to session 'auth-flow'"` + "`" + ` |
+| Session completed | ` + "`" + `"Session 'auth-flow' finished — reviewing output"` + "`" + ` |
+| Escalation during heartbeat | ` + "`" + `"Session 'api-fix' needs your input: staging or prod?"` + "`" + ` |
+| Session error detected | ` + "`" + `"Session 'backend' crashed — attempting restart"` + "`" + ` |
+
+### Rules
+
+- Keep notifications **short** (1 sentence)
+- Don't notify for routine auto-responses (those are logged, not pushed)
+- Always use the chat context from the most recent user message
+- If no ` + "`" + `chat_context` + "`" + ` is available (fresh start), skip the notification and log intent in task-log.md
+
 ## State Management
 
 Maintain ` + "`" + `./state.json` + "`" + ` for persistent context across compactions:
 
 ` + "```json" + `
 {
+  "chat_context": {
+    "platform": "telegram",
+    "chat_id": "-100123456"
+  },
   "sessions": {
     "session-id-here": {
       "title": "frontend",
@@ -1027,11 +1076,20 @@ def create_telegram_bot(config: dict):
             reply_username = message.reply_to_message.from_user.username
             if reply_username and reply_username.lower() == bot_info["username"]:
                 return True
-        # @mention in message entities
+        # @mention in message entities (text messages)
         if message.entities and message.text:
             for entity in message.entities:
                 if entity.type == "mention":
                     mentioned = message.text[
+                        entity.offset : entity.offset + entity.length
+                    ].lower()
+                    if mentioned == f"@{bot_info['username']}":
+                        return True
+        # @mention in caption entities (photos/documents)
+        if message.caption_entities and message.caption:
+            for entity in message.caption_entities:
+                if entity.type == "mention":
+                    mentioned = message.caption[
                         entity.offset : entity.offset + entity.length
                     ].lower()
                     if mentioned == f"@{bot_info['username']}":
@@ -1182,6 +1240,94 @@ def create_telegram_bot(config: dict):
                 f"Restart failed: {result.stderr.strip()}"
             )
 
+    @dp.message(lambda m: m.photo or m.document)
+    async def handle_media(message: types.Message):
+        """Download photo/document and forward to conductor."""
+        if not is_authorized(message):
+            return
+        await ensure_bot_info(message.bot)
+        if not is_bot_addressed(message):
+            return
+
+        # Download the file
+        if message.photo:
+            file_obj = await message.bot.get_file(message.photo[-1].file_id)
+            file_id_short = message.photo[-1].file_id[:16]
+        elif message.document:
+            file_obj = await message.bot.get_file(message.document.file_id)
+            file_id_short = message.document.file_id[:16]
+        else:
+            return
+
+        inbox_dir = Path(os.path.expanduser("~")) / ".agent-deck" / "conductor" / "inbox"
+        inbox_dir.mkdir(parents=True, exist_ok=True)
+
+        ext = Path(file_obj.file_path).suffix if file_obj.file_path else ".bin"
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        local_name = f"{ts}_{file_id_short}{ext}"
+        local_path = inbox_dir / local_name
+
+        await message.bot.download_file(file_obj.file_path, str(local_path))
+        log.info("Downloaded media to %s", local_path)
+
+        # Build message for conductor
+        caption = (message.caption or "").strip()
+        parts = [f"[User sent an image: {local_path}]"]
+        if caption:
+            parts.append(caption)
+        text = "\n".join(parts)
+
+        conductor_names = get_conductor_names()
+        conductors = discover_conductors()
+        target_name, cleaned_msg = parse_conductor_prefix(text, conductor_names)
+
+        target = None
+        if target_name:
+            for c in conductors:
+                if c["name"] == target_name:
+                    target = c
+                    break
+        if target is None:
+            target = get_default_conductor()
+        if target is None:
+            return
+
+        if not cleaned_msg:
+            cleaned_msg = text
+
+        # Prepend chat context tag
+        chat_tag = f"[chat:telegram:{message.chat.id}]"
+        cleaned_msg = f"{chat_tag} {cleaned_msg}"
+
+        session_title = conductor_session_title(target["name"])
+        profile = target["profile"]
+
+        if not ensure_conductor_running(target["name"], profile):
+            return
+
+        log.info("Media message -> [%s]: %s", target["name"], cleaned_msg[:100])
+        name_tag = f"[{target['name']}] " if len(conductors) > 1 else ""
+        status_msg = await message.answer(f"{name_tag}Working on it...")
+
+        loop = asyncio.get_event_loop()
+        ok, response = await loop.run_in_executor(
+            None,
+            lambda: send_to_conductor(
+                session_title,
+                cleaned_msg,
+                profile=profile,
+                wait_for_reply=True,
+                response_timeout=RESPONSE_TIMEOUT,
+            ),
+        )
+        if ok and response:
+            name_tag = f"[{target['name']}] " if len(conductors) > 1 else ""
+            html_response = md_to_tg_html(
+                f"{name_tag}{response}" if name_tag else response
+            )
+            for chunk in split_message(html_response):
+                await message.answer(chunk, parse_mode="HTML")
+
     @dp.message()
     async def handle_message(message: types.Message):
         """Forward any text message to the conductor and return its response."""
@@ -1230,6 +1376,10 @@ def create_telegram_bot(config: dict):
                 f"[Could not start conductor {target['name']}. Check agent-deck.]"
             )
             return
+
+        # Prepend chat context tag so conductor knows where to send notifications
+        chat_tag = f"[chat:telegram:{message.chat.id}]"
+        cleaned_msg = f"{chat_tag} {cleaned_msg}"
 
         # Send to conductor with progress updates
         log.info(
@@ -1520,6 +1670,10 @@ def create_slack_app(config: dict):
             prefix_parts.append(channel_tag)
         if prefix_parts:
             cleaned_msg = " ".join(prefix_parts) + " " + cleaned_msg
+
+        # Prepend chat context tag so conductor knows where to send notifications
+        if event_channel:
+            cleaned_msg = f"[chat:slack:{event_channel}] {cleaned_msg}"
 
         session_title = conductor_session_title(target["name"])
         profile = target["profile"]
@@ -2059,6 +2213,9 @@ def create_discord_bot(config: dict):
         if not cleaned_msg:
             cleaned_msg = text
 
+        # Prepend chat context tag so conductor knows where to send notifications
+        cleaned_msg = f"[chat:discord:{message.channel.id}] {cleaned_msg}"
+
         session_title = conductor_session_title(target["name"])
         profile = target["profile"]
 
@@ -2306,6 +2463,136 @@ async def heartbeat_loop(
 
 
 # ---------------------------------------------------------------------------
+# Outbox watcher — delivers proactive notifications from conductor to users
+# ---------------------------------------------------------------------------
+
+OUTBOX_POLL_INTERVAL = 1  # seconds
+OUTBOX_STALE_SECONDS = 3600  # 1 hour
+
+
+async def outbox_watcher(
+    telegram_bot=None, slack_app=None, discord_bot=None,
+):
+    """Poll conductor outbox directories and deliver notifications."""
+    log.info("Outbox watcher started (poll interval=%ds)", OUTBOX_POLL_INTERVAL)
+    conductor_base = os.path.join(os.path.expanduser("~"), ".agent-deck", "conductor")
+
+    while True:
+        await asyncio.sleep(OUTBOX_POLL_INTERVAL)
+        try:
+            if not os.path.isdir(conductor_base):
+                continue
+            for name in os.listdir(conductor_base):
+                outbox_dir = os.path.join(conductor_base, name, "outbox")
+                if not os.path.isdir(outbox_dir):
+                    continue
+                for fname in sorted(os.listdir(outbox_dir)):
+                    if not fname.endswith(".json"):
+                        continue
+                    fpath = os.path.join(outbox_dir, fname)
+                    try:
+                        await _deliver_outbox_file(
+                            fpath, telegram_bot, slack_app, discord_bot,
+                        )
+                    except Exception as e:
+                        log.error("Outbox delivery error (%s): %s", fname, e)
+                        # Clean up stale files
+                        _gc_stale_outbox_file(fpath)
+        except Exception as e:
+            log.error("Outbox watcher error: %s", e)
+
+
+async def _deliver_outbox_file(fpath, telegram_bot, slack_app, discord_bot):
+    """Read, deliver, and delete a single outbox notification file."""
+    try:
+        with open(fpath, "r") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        log.warning("Skipping invalid outbox file %s: %s", fpath, e)
+        _gc_stale_outbox_file(fpath)
+        return
+
+    platform = data.get("platform", "")
+    chat_id = data.get("chat_id", "")
+    text = data.get("text", "")
+
+    if not platform or not chat_id or not text:
+        log.warning("Outbox file missing fields, deleting: %s", fpath)
+        _safe_delete(fpath)
+        return
+
+    delivered = False
+
+    if platform == "telegram":
+        if telegram_bot:
+            try:
+                await telegram_bot.send_message(
+                    chat_id=int(chat_id), text=text,
+                )
+                delivered = True
+            except Exception as e:
+                log.error("Telegram outbox delivery failed (chat=%s): %s", chat_id, e)
+        else:
+            log.warning("Telegram not configured, dropping outbox notification")
+            delivered = True  # drop it
+
+    elif platform == "slack":
+        if slack_app:
+            try:
+                await slack_app.client.chat_postMessage(
+                    channel=chat_id, text=text,
+                )
+                delivered = True
+            except Exception as e:
+                log.error("Slack outbox delivery failed (channel=%s): %s", chat_id, e)
+        else:
+            log.warning("Slack not configured, dropping outbox notification")
+            delivered = True
+
+    elif platform == "discord":
+        if discord_bot:
+            try:
+                channel = discord_bot.get_channel(int(chat_id))
+                if channel:
+                    await channel.send(text)
+                    delivered = True
+                else:
+                    log.warning("Discord channel %s not found", chat_id)
+                    delivered = True  # drop it
+            except Exception as e:
+                log.error("Discord outbox delivery failed (channel=%s): %s", chat_id, e)
+        else:
+            log.warning("Discord not configured, dropping outbox notification")
+            delivered = True
+
+    else:
+        log.warning("Unknown platform %r in outbox file, deleting: %s", platform, fpath)
+        delivered = True
+
+    if delivered:
+        _safe_delete(fpath)
+
+
+def _gc_stale_outbox_file(fpath):
+    """Delete outbox file if older than OUTBOX_STALE_SECONDS."""
+    try:
+        stat = os.stat(fpath)
+        age = time.time() - stat.st_mtime
+        if age > OUTBOX_STALE_SECONDS:
+            log.info("GC stale outbox file (age=%ds): %s", int(age), fpath)
+            _safe_delete(fpath)
+    except OSError:
+        pass
+
+
+def _safe_delete(fpath):
+    try:
+        os.remove(fpath)
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -2390,8 +2677,17 @@ async def main():
         )
     )
 
+    # Start outbox watcher (delivers proactive notifications from conductor)
+    outbox_task = asyncio.create_task(
+        outbox_watcher(
+            telegram_bot=telegram_bot,
+            slack_app=slack_app,
+            discord_bot=discord_bot,
+        )
+    )
+
     # Run all platforms concurrently
-    tasks = [heartbeat_task]
+    tasks = [heartbeat_task, outbox_task]
     if telegram_dp and telegram_bot:
         tasks.append(asyncio.create_task(telegram_dp.start_polling(telegram_bot)))
         log.info("Telegram bot polling started")
@@ -2406,6 +2702,7 @@ async def main():
         await asyncio.gather(*tasks)
     finally:
         heartbeat_task.cancel()
+        outbox_task.cancel()
         if telegram_bot:
             await telegram_bot.session.close()
         if slack_handler:

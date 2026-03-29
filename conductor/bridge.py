@@ -754,6 +754,10 @@ def create_bot(config: dict) -> tuple[Bot, Dispatcher]:
             )
             return
 
+        # Prepend chat context tag so conductor knows where to send notifications
+        chat_tag = f"[chat:telegram:{message.chat.id}]"
+        cleaned_msg = f"{chat_tag} {cleaned_msg}"
+
         # Send to conductor with progress updates
         log.info(
             "User message -> [%s]: %s", target_profile, cleaned_msg[:100]
@@ -1029,6 +1033,64 @@ async def heartbeat_loop(bot: Bot, config: dict):
 
 
 # ---------------------------------------------------------------------------
+# Outbox watcher — delivers proactive notifications from conductor to users
+# ---------------------------------------------------------------------------
+
+OUTBOX_POLL_INTERVAL = 1  # seconds
+OUTBOX_STALE_SECONDS = 3600  # 1 hour
+
+
+async def outbox_watcher(bot: Bot):
+    """Poll conductor outbox directories and deliver Telegram notifications."""
+    log.info("Outbox watcher started (poll interval=%ds)", OUTBOX_POLL_INTERVAL)
+    conductor_base = os.path.join(os.path.expanduser("~"), ".agent-deck", "conductor")
+
+    while True:
+        await asyncio.sleep(OUTBOX_POLL_INTERVAL)
+        try:
+            if not os.path.isdir(conductor_base):
+                continue
+            for name in os.listdir(conductor_base):
+                outbox_dir = os.path.join(conductor_base, name, "outbox")
+                if not os.path.isdir(outbox_dir):
+                    continue
+                for fname in sorted(os.listdir(outbox_dir)):
+                    if not fname.endswith(".json"):
+                        continue
+                    fpath = os.path.join(outbox_dir, fname)
+                    try:
+                        with open(fpath, "r") as f:
+                            data = json.load(f)
+                        platform = data.get("platform", "")
+                        chat_id = data.get("chat_id", "")
+                        text = data.get("text", "")
+                        if platform == "telegram" and chat_id and text:
+                            await bot.send_message(
+                                chat_id=int(chat_id), text=text,
+                            )
+                        elif platform != "telegram":
+                            log.warning(
+                                "Standalone bridge only supports Telegram, "
+                                "dropping %s notification", platform,
+                            )
+                        try:
+                            os.remove(fpath)
+                        except OSError:
+                            pass
+                    except Exception as e:
+                        log.error("Outbox delivery error (%s): %s", fname, e)
+                        # Clean up stale files
+                        try:
+                            age = time.time() - os.stat(fpath).st_mtime
+                            if age > OUTBOX_STALE_SECONDS:
+                                os.remove(fpath)
+                        except OSError:
+                            pass
+        except Exception as e:
+            log.error("Outbox watcher error: %s", e)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -1046,14 +1108,16 @@ async def main():
 
     bot, dp = create_bot(config)
 
-    # Run heartbeat in background
+    # Run heartbeat and outbox watcher in background
     heartbeat_task = asyncio.create_task(heartbeat_loop(bot, config))
+    outbox_task = asyncio.create_task(outbox_watcher(bot))
 
     try:
         log.info("Telegram bot polling started")
         await dp.start_polling(bot)
     finally:
         heartbeat_task.cancel()
+        outbox_task.cancel()
         await bot.session.close()
 
 
